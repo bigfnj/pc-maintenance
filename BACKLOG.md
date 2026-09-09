@@ -55,19 +55,30 @@ from `Get-ChildItem`'s `.FullName`. Do them as one batch: same file, same test s
 **Add one test per pattern.** The suite already does this for the current entries; the gap is that
 the entries themselves are incomplete, not that they are untested.
 
-## 3. A liveness check so `agent-scratchpads` can act
+## 3. ~~A liveness check so `agent-scratchpads` can act~~ DONE 2026-09-09
 
-**The prize:** 3.75 GB across ~940 idle sessions today, growing every session, currently
-report-only forever.
+Shipped, and the entry that used to sit here was **wrong**, which is worth keeping rather than
+deleting. It said the module "needs a real liveness check, not a longer timeout". Two things
+changed that:
 
-**The blocker, restated so nobody solves the wrong problem:** directory mtime is not a liveness
-signal. An agent session can sit idle for hours between turns and then resume, so any age floor
-will eventually delete a live session's working directory mid-task. **A longer timeout is not the
-fix** — it only makes the failure rarer and much harder to attribute.
+- **Nothing in a scratchpad is non-regenerable.** The durable session record (transcript, and any
+  persisted large tool output) lives under `~\.claude\projects\`, not in Temp. The worst case on
+  resuming a very old session is regenerating a throwaway script.
+- **The real bug was never liveness, it was the clock.** Windows updates a directory's mtime only
+  when *its own* entries change, so a session root's timestamp is effectively its creation time.
+  Measured on a live session: root 06:01, newest file inside 14:29. An mtime rule really would
+  have deleted in-flight work, but the fix is to take the age from the newest file inside, not to
+  add a handle check.
 
-**What would actually work:** an open handle on the session directory, or a pid file the agent
-maintains and the module checks. Until one of those exists this stays at `AutoApply = $false`, and
-its `Repair` should keep refusing even if called.
+Now `AutoApply = $true` with a 14-day floor, taking age from the newest file, matching only
+session-GUID directories, and refusing `bundled-skills` outright. Currently identifies 933
+sessions and 3.22 GB. Four rules mutation-tested.
+
+⚠ The `bundled-skills` guard was **not provable at first**, and the reason is a trap worth
+remembering: the fixture path was written through a Python replacement string where `` was eaten
+as an escape, so the directory the test claimed to create never existed and the test passed no
+matter what. The patch script asserted its *anchor* matched; it did not verify the *replacement*
+landed. Assert both.
 
 ## 4. TOCTOU inside `Remove-PMPath`
 

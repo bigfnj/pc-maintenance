@@ -141,9 +141,9 @@ It 'every module category is permitted by the shipped manifest' {
     }
     return $true
 }
-It 'exactly the two proven-mechanical modules declare AutoApply' {
+It 'exactly the three proven-mechanical modules declare AutoApply' {
     $auto = @($modDirs | Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } | ForEach-Object { $_.Name } | Sort-Object)
-    return (($auto -join ',') -eq 'plex-bif-orphans,vs-installer-scratch')
+    return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
 }
 It 'every module reports a true Count alongside a possibly-capped Items' {
     # Two modules cap Items so a 6,935-orphan run does not bloat the run json. Without a
@@ -655,6 +655,111 @@ It 'the generated name matches the pattern the pruner looks for' {
     $n = Get-PMReportFileName -When ([datetime]'2026-09-09T13:57:13')
     return ($n -eq 'PC-Maintenance Report - 2026-09-09 135713.html' -and
             $n -match $script:PMReportNamePattern)
+}
+
+Write-Host "`n== agent-scratchpads now deletes, so its two rules get tested hardest ==" -ForegroundColor Cyan
+function New-PMAgentTree {
+    <#
+        A miniature Temp\claude: two session shapes, the shared infrastructure that must survive,
+        and a session whose DIRECTORY looks ancient while a file inside is fresh.
+    #>
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("pm-ag-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $old = (Get-Date).AddDays(-60)
+    function Touch($p, $when) {
+        New-Item -ItemType Directory -Path (Split-Path $p -Parent) -Force | Out-Null
+        Set-Content -LiteralPath $p -Value 'x' -Encoding UTF8
+        (Get-Item -LiteralPath $p).LastWriteTime = $when
+    }
+    # 1. bare GUID at the top level, genuinely idle
+    Touch (Join-Path $root '11111111-1111-1111-1111-111111111111\scratchpad\a.txt') $old
+    # 2. GUID under a project slug, genuinely idle
+    Touch (Join-Path $root 'proj-slug\22222222-2222-2222-2222-222222222222\scratchpad\b.txt') $old
+    # 3. LIVE session: ancient directory timestamp, fresh file inside. The trap.
+    Touch (Join-Path $root '33333333-3333-3333-3333-333333333333\scratchpad\c.txt') (Get-Date)
+    # 4. shared infrastructure, old, must never be considered. bundled-skills really does nest
+    #    hash-named directories on this box, so a GUID-shaped child is a realistic shape - and
+    #    it is what makes the never-touch list reachable rather than a belt the GUID rule
+    #    already covers on its own.
+    Touch (Join-Path $root 'bundled-skills\dataviz\SKILL.md') $old
+    Touch (Join-Path $root 'bundled-skills\44444444-4444-4444-4444-444444444444\dataviz\SKILL.md') $old
+    Touch (Join-Path $root 'auto-mode-classifier-errors\err.log') $old
+    # 5. a non-GUID project dir with a non-GUID child, old
+    Touch (Join-Path $root 'proj-slug\not-a-session\x.txt') $old
+    foreach ($d in @('11111111-1111-1111-1111-111111111111',
+                     'proj-slug\22222222-2222-2222-2222-222222222222',
+                     '33333333-3333-3333-3333-333333333333')) {
+        (Get-Item -LiteralPath (Join-Path $root $d)).LastWriteTime = $old   # every root looks ancient
+    }
+    return $root
+}
+function Get-PMAgentPicks {
+    param([string]$Root)
+    $ctx = @{ UserProfile = $null }
+    # point the module at the fixture by overriding its root resolver in this scope
+    function Get-AgentScratchRoot { param($Context) $script:FixtureRoot }
+    $script:FixtureRoot = $Root
+    return @(Get-AgentScratchCandidates -Context $ctx | ForEach-Object { Split-Path $_.Path -Leaf })
+}
+. (Join-Path $script:RepoRoot 'modules\agent-scratchpads\module.ps1')
+
+It 'picks up both session shapes' {
+    $r = New-PMAgentTree
+    try {
+        $picks = Get-PMAgentPicks -Root $r
+        return (($picks -contains '11111111-1111-1111-1111-111111111111') -and
+                ($picks -contains '22222222-2222-2222-2222-222222222222'))
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'spares a live session whose DIRECTORY looks ancient' {
+    # The whole reason age comes from the newest file inside. With directory mtime this session
+    # is 60 days old and gets deleted while it is running.
+    $r = New-PMAgentTree
+    try { return ((Get-PMAgentPicks -Root $r) -notcontains '33333333-3333-3333-3333-333333333333') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'never considers bundled-skills or the classifier errors' {
+    # bundled-skills is where a RUNNING session loads skill payloads from. Deleting it because it
+    # is old would break skills for every session on the box.
+    $r = New-PMAgentTree
+    try {
+        $picks = Get-PMAgentPicks -Root $r
+        return (($picks -notcontains 'bundled-skills') -and ($picks -notcontains 'auto-mode-classifier-errors'))
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a GUID-shaped directory INSIDE bundled-skills is still protected' {
+    # This is what the never-touch list is actually for. The GUID rule alone would happily match
+    # bundled-skills\<guid>\ and delete a skill payload a running session loads from.
+    $r = New-PMAgentTree
+    try { return ((Get-PMAgentPicks -Root $r) -notcontains '44444444-4444-4444-4444-444444444444') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'ignores a directory whose name is not a session GUID' {
+    $r = New-PMAgentTree
+    try { return ((Get-PMAgentPicks -Root $r) -notcontains 'not-a-session') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'Get-PMNewestWriteUtc reports the newest file, not the directory stamp' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path (Join-Path $d 'deep') -Force | Out-Null
+    try {
+        $f = Join-Path $d 'deep\fresh.txt'
+        Set-Content -LiteralPath $f -Value 'x' -Encoding UTF8
+        (Get-Item -LiteralPath $d).LastWriteTime = (Get-Date).AddDays(-60)
+        $newest = Get-PMNewestWriteUtc -Path $d
+        return ($newest -gt (Get-Date).ToUniversalTime().AddDays(-1))
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'an empty directory dates from itself rather than reading as ancient' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try { return ((Get-PMNewestWriteUtc -Path $d) -gt (Get-Date).ToUniversalTime().AddDays(-1)) }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'agent-scratchpads is now one of three modules allowed to act' {
+    $auto = @(Get-ChildItem (Join-Path $script:RepoRoot 'modules') -Directory |
+        Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } |
+        ForEach-Object { $_.Name } | Sort-Object)
+    return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
 }
 
 Write-Host "`n== HTML report ==" -ForegroundColor Cyan

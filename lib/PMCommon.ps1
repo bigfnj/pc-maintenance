@@ -359,6 +359,55 @@ function Get-PMPathSize {
     return $total
 }
 
+function Get-PMNewestWriteUtc {
+    <#
+        The newest LastWriteTimeUtc of any file anywhere under $Path.
+
+        A directory's own mtime is not the age of its contents. Windows updates it only when
+        entries are added to or removed from THAT directory, not when a file deeper in the tree is
+        written. Measured on a live agent session directory: the root said 06:01 while the newest
+        file inside said 14:29, an 8.5 hour lag on a session that was actively running.
+
+        Any rule that deletes "directories older than N days" by directory mtime will therefore
+        eventually delete something that is still in use. That is survivable while a module only
+        reports, and not survivable once it acts.
+
+        -NewerThanUtc lets the caller stop the walk the moment it finds anything newer, which is
+        what keeps this cheap: an active directory exits after one file, and only genuinely idle
+        directories are walked in full.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [datetime]$NewerThanUtc = [datetime]::MinValue,
+        [switch]$Critical
+    )
+    $newest = [datetime]::MinValue
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            foreach ($f in $di.EnumerateFiles()) {
+                if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
+                if ($newest -gt $NewerThanUtc) { return $newest }   # early exit: known to be active
+            }
+            foreach ($sub in $di.EnumerateDirectories()) {
+                if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                $stack.Push($sub.FullName)
+            }
+        } catch {
+            Add-PMReadError -Errors $_ -Critical:$Critical
+        }
+    }
+    # An empty directory has no files to date it. Fall back to its own timestamp rather than
+    # returning MinValue, which would read as "ancient" and make it instantly deletable.
+    if ($newest -eq [datetime]::MinValue) {
+        try { $newest = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LastWriteTimeUtc } catch {}
+    }
+    return $newest
+}
+
 function Expand-PMRoot {
     <#
         Expand a declared root from module.psd1 into a real path for THIS run.

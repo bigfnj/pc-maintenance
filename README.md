@@ -59,14 +59,18 @@ exists and you cannot see it, not that it is missing.
 | `vs-installer-scratch` | VS Installer self-extractions + its applied payload cache, older than 24h | **yes** | 13,341 directories / 48 GB accumulated over six months, one per update check |
 | `plex-bif-orphans` | `.tmp` beside a `.bif` preview that already exists | **yes** | 6,935 `.tmp` for 6,935 `.bif`, so recurrence is exactly 100% |
 | `stale-app-temp` | named app scratch (Adobe, CreativeCloud, OCCT, WinGet, 7-Zip, pip) idle >30d | no | one app held 12.9 GB idle for two months |
-| `agent-scratchpads` | per-session coding-agent scratch idle >14d | no | 6.51 GB across 941 idle sessions |
+| `agent-scratchpads` | whole session directories under `Temp\claude` idle >14d | **yes** | 933 sessions / 3.22 GB, measured across 1,187 session dirs totalling 6.87 GB |
 
-The two that may act share a property the other two lack: a **mechanical** rule with no judgement
-in it, and a recurrence rate near 100%. `stale-app-temp` stays observational because "stale" is a
-per-application judgement. `agent-scratchpads` stays observational for a harder reason: directory
-mtime is not a liveness signal, so deleting a session that is merely idle between turns would
-break a running agent. That one needs a real liveness check, not a longer timeout, and its
-`Repair` refuses even if called.
+The three that may act share a property `stale-app-temp` lacks: a **mechanical** rule with no
+judgement in it. `stale-app-temp` stays observational because "stale" is a per-application call.
+
+`agent-scratchpads` is worth reading before you trust it, because two rules are doing all the
+work. It matches **only directories whose name is a session GUID**, since the same tree holds
+`bundled-skills`, which a *running* session loads skill payloads from. And it takes age from the
+**newest file inside**, never the directory's own mtime: Windows bumps a directory timestamp only
+when its own entries change, so a session root's stamp is effectively its creation time. Measured
+on a live session, the root said 06:01 while the newest file inside said 14:29. An mtime rule
+would delete in-flight work from any session outliving the floor.
 
 ## Three things that keep the output honest
 
