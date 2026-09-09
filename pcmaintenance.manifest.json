@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "_comment": "pc-maintenance: ongoing Windows housekeeping as pluggable modules. Report-only unless the dispatcher gets -Apply AND the module declares AutoApply. Borrowed from preference-guard's framework; the task cadence here is WEEKLY, with no Group Policy triggers, because nothing this tool watches is caused by a policy refresh.",
+  "task": {
+    "name": "PcMaintenance",
+    "weeklyDay": "Sunday",
+    "weeklyAt": "03:00:00",
+    "runIfMissed": true
+  },
+  "allowedCategories": ["maintenance", "hygiene"],
+  "logRetention": { "maxRuns": 50, "maxAgeDays": 90 },
+  "modules": [
+    { "id": "vs-installer-scratch", "enabled": true, "order": 10 },
+    { "id": "plex-bif-orphans",     "enabled": true, "order": 20 },
+    { "id": "stale-app-temp",       "enabled": true, "order": 30 },
+    { "id": "agent-scratchpads",    "enabled": true, "order": 40 }
+  ]
+}

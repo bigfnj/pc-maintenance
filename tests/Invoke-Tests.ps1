@@ -1,0 +1,148 @@
+#Requires -Version 5.1
+<#
+    Non-destructive test runner for pc-maintenance. No Pester dependency, same spirit as
+    preference-guard's tests/Invoke-Tests.ps1.
+
+    Nothing here deletes anything: the guard tests assert on Test-PMPathSafe directly, and the
+    removal tests run against a throwaway tree under the caller's TEMP with -WhatIfOnly.
+
+    Run under Windows PowerShell 5.1 as well as 7, because the scheduled task runs 5.1:
+      powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
+#>
+[CmdletBinding()]
+param()
+
+$ErrorActionPreference = 'Continue'
+$root = Split-Path -Parent $PSScriptRoot
+$libDir = Join-Path $root 'lib'
+foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1') { . (Join-Path $libDir $f) }
+
+$script:Pass = 0; $script:Fail = 0
+function It {
+    param([string]$Name, [scriptblock]$Body)
+    try {
+        $r = & $Body
+        if ($r) { $script:Pass++; Write-Host "  ok   $Name" -ForegroundColor Green }
+        else { $script:Fail++; Write-Host "  FAIL $Name" -ForegroundColor Red }
+    } catch {
+        $script:Fail++; Write-Host "  FAIL $Name -- $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`n== parses under $($PSVersionTable.PSVersion) ==" -ForegroundColor Cyan
+foreach ($f in (Get-ChildItem $root -Recurse -Filter *.ps1 -File)) {
+    It "parses: $($f.Name)" {
+        $errs = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errs)
+        return (-not $errs -or $errs.Count -eq 0)
+    }
+}
+
+Write-Host "`n== dispatcher bootstrap ==" -ForegroundColor Cyan
+It 'the dispatcher does not take PSScriptRoot as a param default' {
+    # Under PS 5.1, [CmdletBinding()] makes $PSScriptRoot EMPTY inside a param default block.
+    # It cost a full debugging cycle once; this pins it so nobody "tidies" the body-resolution
+    # back into the param block, where it fails silently and cascades into every Join-Path.
+    $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
+    $paramBlock = [regex]::Match($src, '(?s)\[CmdletBinding\(\)\]\s*param\((.*?)\n\)').Groups[1].Value
+    return ($paramBlock -notmatch 'PSScriptRoot')
+}
+It 'the dispatcher resolves PayloadRoot in its body' {
+    $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
+    return ($src -match '(?m)^\s*if \(-not \$PayloadRoot\) \{ \$PayloadRoot = \$PSScriptRoot \}')
+}
+
+Write-Host "`n== path guard ==" -ForegroundColor Cyan
+$roots = @('C:\Users\Someone\AppData\Local\Temp')
+It 'accepts a normal target under a declared root' { Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\abcd1234.xyz' -Roots $roots }
+It 'refuses the declared root itself'              { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp' -Roots $roots) }
+It 'refuses a path outside every declared root'    { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Other\x' -Roots $roots) }
+It 'refuses a drive root'                          { -not (Test-PMPathSafe -Path 'C:\' -Roots @('C:\')) }
+It 'refuses Windows even if declared as a root'    { -not (Test-PMPathSafe -Path 'C:\Windows\System32' -Roots @('C:\Windows')) }
+It 'refuses Program Files even if declared'        { -not (Test-PMPathSafe -Path 'C:\Program Files\Thing\sub' -Roots @('C:\Program Files')) }
+It 'refuses user Documents even if declared'       { -not (Test-PMPathSafe -Path 'C:\Users\Someone\Documents\book' -Roots @('C:\Users\Someone')) }
+It 'refuses a Docker volume tree'                  { -not (Test-PMPathSafe -Path 'C:\ProgramData\docker\volumes\finance_data\_data' -Roots @('C:\ProgramData\docker')) }
+It 'refuses DockerDesktop scratch'                 { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\DockerDesktop\x' -Roots $roots) }
+It 'refuses anything under a .git directory'       { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\repo\.git\objects' -Roots $roots) }
+It 'refuses node_modules'                          { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\p\node_modules\x' -Roots $roots) }
+It 'refuses a path shallower than MinDepth'        { -not (Test-PMPathSafe -Path 'C:\Temp' -Roots @('C:\')) }
+It 'refuses an empty path'                         { -not (Test-PMPathSafe -Path '' -Roots $roots) }
+It 'refuses when the module declared no roots'     { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\x' -Roots @()) }
+It 'is not fooled by a traversal back out'         { -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\..\..\..\Documents\x' -Roots $roots) }
+
+Write-Host "`n== apply gate (both sides must agree) ==" -ForegroundColor Cyan
+It 'report-only run never applies, even for AutoApply' { -not (Test-PMApplyAllowed -Apply $false -ModuleInfo @{ AutoApply = $true }) }
+It 'apply run does not apply without AutoApply'        { -not (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{}) }
+It 'apply run does not apply when AutoApply is false'  { -not (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{ AutoApply = $false }) }
+It 'apply run applies only when both agree'            {      (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{ AutoApply = $true }) }
+
+Write-Host "`n== category governance ==" -ForegroundColor Cyan
+$mf = [pscustomobject]@{ allowedCategories = @('maintenance', 'hygiene') }
+It 'allows a listed category'                    { Test-PMCategoryAllowed -Category 'maintenance' -Manifest $mf }
+It 'refuses an unlisted category'                { -not (Test-PMCategoryAllowed -Category 'dev-enablement' -Manifest $mf) }
+It 'refuses an empty category'                   { -not (Test-PMCategoryAllowed -Category '' -Manifest $mf) }
+$mfBad = [pscustomobject]@{ allowedCategories = @('maintenance', 'firewall') }
+It 'forbidden set beats a mislabelled allowlist' { -not (Test-PMCategoryAllowed -Category 'firewall' -Manifest $mfBad) }
+
+Write-Host "`n== shipped modules ==" -ForegroundColor Cyan
+$modDirs = Get-ChildItem (Join-Path $root 'modules') -Directory
+It 'every module loads and declares the required keys' {
+    foreach ($d in $modDirs) { $null = Import-PMModuleInfo -ModuleDir $d.FullName }
+    return $true
+}
+It 'every module id matches its directory name' {
+    foreach ($d in $modDirs) { if ((Import-PMModuleInfo -ModuleDir $d.FullName).Id -ne $d.Name) { return $false } }
+    return $true
+}
+It 'every module category is permitted by the shipped manifest' {
+    $m = Get-PMManifest -Path (Join-Path $root 'pcmaintenance.manifest.json')
+    foreach ($d in $modDirs) {
+        if (-not (Test-PMCategoryAllowed -Category (Import-PMModuleInfo -ModuleDir $d.FullName).Category -Manifest $m)) { return $false }
+    }
+    return $true
+}
+It 'exactly the two proven-mechanical modules declare AutoApply' {
+    $auto = @($modDirs | Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } | ForEach-Object { $_.Name } | Sort-Object)
+    return (($auto -join ',') -eq 'plex-bif-orphans,vs-installer-scratch')
+}
+It 'every module reports a true Count alongside a possibly-capped Items' {
+    # Two modules cap Items so a 6,935-orphan run does not bloat the run json. Without a
+    # separate Count the dispatcher would log the CAP and disagree with the module's own
+    # Detail string, which is the "two numbers, one of them decorative" trap.
+    foreach ($d in $modDirs) {
+        $src = Get-Content -LiteralPath (Join-Path $d.FullName 'module.ps1') -Raw
+        if ($src -notmatch 'Clean\s+=\s+\$false') { return $false }
+        if ($src -notmatch 'Count\s+=\s+@\(\$items\)\.Count') { return $false }
+    }
+    return $true
+}
+It 'every module in the manifest exists on disk' {
+    $m = Get-PMManifest -Path (Join-Path $root 'pcmaintenance.manifest.json')
+    foreach ($e in $m.modules) { if (-not (Test-Path (Join-Path $root "modules\$($e.id)"))) { return $false } }
+    return $true
+}
+
+Write-Host "`n== Remove-PMPath ==" -ForegroundColor Cyan
+$sandbox = Join-Path ([IO.Path]::GetTempPath()) ("pm-tests-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$victim = Join-Path $sandbox 'deep\target'
+New-Item -ItemType Directory -Path $victim -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $victim 'f.txt') -Value 'x' -Encoding UTF8
+try {
+    It 'report-only computes size and removes nothing' {
+        $r = Remove-PMPath -Path $victim -Roots @($sandbox) -WhatIfOnly
+        return ((-not $r.Removed) -and $r.Reason -eq 'report-only' -and (Test-Path $victim))
+    }
+    It 'refuses an unsafe path without touching it' {
+        $r = Remove-PMPath -Path 'C:\Windows\System32' -Roots @('C:\Windows')
+        return ((-not $r.Removed) -and $r.Skipped -and $r.Reason -eq 'refused by path guard' -and (Test-Path 'C:\Windows\System32'))
+    }
+    It 'removes a safe target when asked for real' {
+        $r = Remove-PMPath -Path $victim -Roots @($sandbox)
+        return ($r.Removed -and -not (Test-Path $victim))
+    }
+} finally {
+    Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
+exit $(if ($script:Fail) { 1 } else { 0 })
