@@ -72,7 +72,7 @@ catch {
 }
 
 $results = @()
-$summary = [ordered]@{ total = 0; clean = 0; found = 0; applied = 0; skipped = 0; errors = 0; bytes = [int64]0 }
+$summary = [ordered]@{ total = 0; clean = 0; found = 0; applied = 0; skipped = 0; unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
 
 try {
     $mode = if ($Apply) { 'APPLY' } else { 'REPORT-ONLY' }
@@ -90,7 +90,7 @@ try {
         $modId  = [string]$mod.id
         $modDir = Join-Path $modulesDir $modId
         $summary.total++
-        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0; items = @() }
+        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0; readErrors = 0; partial = 0; items = @() }
         try {
             $info = Import-PMModuleInfo -ModuleDir $modDir
 
@@ -113,7 +113,9 @@ try {
                 IsInteractiveUserLoggedIn = $user.LoggedIn
             }
 
-            $t = Invoke-PMModulePhase -ModuleDir $modDir -Phase Test -Context $ctx -LibDir $libDir -Entry $info.Entry
+            $tw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Test -Context $ctx -LibDir $libDir -Entry $info.Entry
+            $t = $tw.Result
+            $row.readErrors = [int]$tw.ReadErrors
             $row.bytes = if ($null -ne $t.Bytes) { [int64]$t.Bytes } else { [int64]0 }
             $row.items = @($t.Items)
             # Count is the TRUE number found. Items is capped by some modules so a 6,935-orphan
@@ -121,6 +123,25 @@ try {
             # cap and quietly disagree with the module's own Detail string.
             $row.count = if ($null -ne $t.Count) { [int]$t.Count } else { @($t.Items).Count }
             $row.detail = [string]$t.Detail
+
+            # A module that could not READ must never pass as clean. Silence and emptiness look
+            # identical from the outside, and the whole value of a weekly report is that "clean"
+            # means something. Found on the first SYSTEM run: it refused to traverse a
+            # cross-volume junction and the module reported a clean machine over 28 real orphans.
+            if ($tw.CriticalReadErrors -gt 0) {
+                $row.status = 'unverified'
+                $row.detail = "could not read $($tw.CriticalReadErrors) required location(s): $($tw.ReadErrorSample)"
+                Write-PMLog "$modId UNVERIFIED - $($row.detail)" 'WARN'
+                $summary.unverified++; $results += $row; continue
+            }
+            # Incidental unreadable spots (a locked _MEI dir, a file that vanished mid-scan) are
+            # PARTIAL coverage, not blindness. Recorded and shown, but they do not redden the run:
+            # a permanent benign red is how a control gets ignored.
+            if ($tw.ReadErrors -gt 0) {
+                $row.partial = [int]$tw.ReadErrors
+                $summary.partial += [int]$tw.ReadErrors
+                Write-PMLog "$modId partial coverage - $($tw.ReadErrors) location(s) unreadable" 'SKIP'
+            }
 
             if ($t.Clean) {
                 $row.status = 'clean'
@@ -136,7 +157,8 @@ try {
                 Write-PMLog "$modId not removed - $reason" 'SKIP'; $results += $row; continue
             }
 
-            $r = Invoke-PMModulePhase -ModuleDir $modDir -Phase Repair -Context $ctx -LibDir $libDir -Entry $info.Entry
+            $rw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Repair -Context $ctx -LibDir $libDir -Entry $info.Entry
+            $r = $rw.Result
             $row.status = if ($r.Ok) { 'applied' } else { 'error' }
             $row.detail = [string]$r.Detail
             $row.bytes  = if ($null -ne $r.Bytes) { [int64]$r.Bytes } else { [int64]0 }
@@ -155,7 +177,9 @@ try {
         $results += $row
     }
 } finally {
-    $exitCode = if ($summary.errors -gt 0) { 1 } else { 0 }
+    # unverified is a real failure of the sweep's purpose, so it earns a non-zero exit too:
+    # a weekly job that cannot see must not report success.
+    $exitCode = if ($summary.errors -gt 0 -or $summary.unverified -gt 0) { 1 } else { 0 }
     $runObj = [ordered]@{
         runId = $runId; startedUtc = $startedUtc; finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
         version = $DispatcherVersion; mode = $(if ($Apply) { 'apply' } else { 'report' })
@@ -182,9 +206,9 @@ try {
         }
     }
 
-    Write-PMLog ('=== SUMMARY total={0} clean={1} found={2} applied={3} skipped={4} errors={5} freed={6} (exit {7}) ===' -f `
+    Write-PMLog ('=== SUMMARY total={0} clean={1} found={2} applied={3} skipped={4} unverified={5} errors={6} freed={7} (exit {8}) ===' -f `
             $summary.total, $summary.clean, $summary.found, $summary.applied, $summary.skipped,
-            $summary.errors, (Format-PMBytes $summary.bytes), $exitCode) $(if ($exitCode) { 'ERROR' } else { 'OK' })
+            $summary.unverified, $summary.errors, (Format-PMBytes $summary.bytes), $exitCode) $(if ($exitCode) { 'ERROR' } else { 'OK' })
 
     try {
         $ret = $runObj.summary  # retention below is manifest-driven, read defensively

@@ -6,7 +6,9 @@
     RequiresUserSid   = $true
     RequiresElevation = $false
     AutoApply         = $true
-    Roots             = @('%LOCALAPPDATA%\Plex Media Server\Media')
+    # Resolved at run time by the module (the Media dir is commonly a junction to another
+    # volume), so this records intent; the module passes the RESOLVED root to the guard.
+    Roots             = @('<resolved Plex Media root>')
     Entry             = 'module.ps1'
     Description       = 'Remove stale .tmp files left beside every generated Plex video preview (.bif). Measured 2026-09-02: exactly 6,935 .bif and 6,935 .tmp, so the leak recurs on every preview generated without exception.'
     Details           = @'

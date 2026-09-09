@@ -21,7 +21,7 @@ function Get-AgentScratchCandidates {
     # Layout is <root>\<project-slug>\<session-guid>\..., so the session directory is one level
     # down. Reporting per session rather than per project keeps a busy project from masking one
     # abandoned session, and vice versa.
-    foreach ($proj in (Get-PMChildDirectory -Path $root)) {
+    foreach ($proj in (Get-PMChildDirectory -Path $root -Critical)) {
         foreach ($sess in (Get-PMChildDirectory -Path $proj.FullName)) {
             if ($sess.LastWriteTime -ge $cut) { continue }
             $out += [pscustomobject]@{

@@ -144,6 +144,84 @@ try {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "`n== blind is not clean ==" -ForegroundColor Cyan
+It 'the read-error collector records instead of swallowing' {
+    Clear-PMReadErrors
+    $null = Get-PMChildDirectory -Path (Join-Path ([IO.Path]::GetTempPath()) 'pm-does-not-exist-xyz')
+    $before = Get-PMReadErrorCount           # a missing path is not an error, it is an answer
+    try { Get-ChildItem -LiteralPath 'C:\__nope__\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ }
+    return ($before -eq 0 -and (Get-PMReadErrorCount) -eq 1 -and (Get-PMCriticalReadErrorCount) -eq 0 -and (Get-PMReadErrorSample))
+}
+It 'only a CRITICAL read failure invalidates the answer' {
+    Clear-PMReadErrors
+    try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ }
+    try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ -Critical }
+    return ((Get-PMReadErrorCount) -eq 2 -and (Get-PMCriticalReadErrorCount) -eq 1)
+}
+It 'every shipped module marks its load-bearing read Critical' {
+    # A module whose root read is not Critical can report clean while blind, which is the whole
+    # bug. Cheap to forget, so it is pinned rather than trusted.
+    foreach ($d in (Get-ChildItem (Join-Path $root 'modules') -Directory)) {
+        $src = Get-Content -LiteralPath (Join-Path $d.FullName 'module.ps1') -Raw
+        if ($src -notmatch '-Critical') { return $false }
+    }
+    return $true
+}
+It 'the dispatcher checks unverified BEFORE it checks clean' {
+    # Order is the whole guarantee. If the clean branch ran first, a module that could not read
+    # would return Clean=$true and continue out before anything noticed. Asserting only that the
+    # unverified block EXISTS would still pass with the branches swapped.
+    $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
+    $iUnver = $src.IndexOf('$tw.CriticalReadErrors -gt 0')
+    $iClean = $src.IndexOf('if ($t.Clean)')
+    return ($iUnver -gt 0 -and $iClean -gt 0 -and $iUnver -lt $iClean)
+}
+It 'an unverified module makes the run exit non-zero' {
+    $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
+    return ($src -match '\$summary\.errors -gt 0 -or \$summary\.unverified -gt 0')
+}
+It 'Resolve-PMReparsePoint returns a plain path unchanged' {
+    $p = [IO.Path]::GetTempPath().TrimEnd('\')
+    return ((Resolve-PMReparsePoint -Path $p) -eq $p)
+}
+It 'Resolve-PMReparsePoint follows a junction to its target' {
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-j-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'; $link = Join-Path $base 'link'
+    New-Item -ItemType Directory -Path $real -Force | Out-Null
+    try {
+        $null = cmd /c mklink /J "`"$link`"" "`"$real`"" 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { return $true }   # no junction support: not a failure
+        return ((Resolve-PMReparsePoint -Path $link) -eq $real)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'end to end: a module that cannot read is reported unverified, not clean' {
+    $fx = Join-Path ([IO.Path]::GetTempPath()) ("pm-fx-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $md = Join-Path $fx 'modules\blindmod'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    @'
+@{ Id='blindmod'; Name='Blind'; Category='maintenance'; Version='1.0.0'; RequiresUserSid=$false
+   AutoApply=$false; Roots=@('C:\nowhere'); Entry='module.ps1'; Description='fixture' }
+'@ | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    @'
+function Test-PMModule {
+    param($Context)
+    try { Get-ChildItem -LiteralPath 'C:\__nope__\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ -Critical }
+    # Claims clean while blind - exactly the bug this guard exists for.
+    [pscustomobject]@{ Clean = $true; Detail = 'looks clean to me'; Bytes = [int64]0; Items = @() }
+}
+function Repair-PMModule { param($Context) [pscustomobject]@{ Changed=$false; Ok=$true; Bytes=[int64]0; Detail='' } }
+'@ | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"blindmod","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fx 'Invoke-PcMaintenance.ps1') -NoReport 2>&1
+        $j = Get-Content -LiteralPath (Join-Path $fx 'logs\latest.json') -Raw | ConvertFrom-Json
+        return ($j.modules[0].status -eq 'unverified' -and $j.summary.unverified -eq 1 -and $j.exitCode -eq 1)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Write-Host "`n== HTML report ==" -ForegroundColor Cyan
 $fakeRun = [ordered]@{
     runId = 'test-run'; startedUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -153,7 +231,7 @@ $fakeRun = [ordered]@{
         [ordered]@{ id = 'mod-found'; status = 'reported'; detail = 'two things'; bytes = [int64]2048; count = 2
                     items = @(@{ path = 'C:\t\a & <b>"q"'; bytes = 1024; ageDays = 5 }, @{ path = 'C:\t\b'; bytes = 1024 }) }
     )
-    summary = [ordered]@{ total = 2; clean = 1; found = 1; applied = 0; skipped = 0; errors = 0; bytes = [int64]0 }
+    summary = [ordered]@{ total = 2; clean = 1; found = 1; applied = 0; skipped = 0; unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
     exitCode = 0
 }
 $reportOut = Join-Path ([IO.Path]::GetTempPath()) ("pm-report-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".html")
@@ -185,7 +263,7 @@ try {
             runId='r'; startedUtc=(Get-Date).ToUniversalTime().ToString('o'); version='0'; mode='report'
             modules=@([ordered]@{ id='m'; status='reported'; detail='d'; bytes=[int64]100; count=940
                                   items=@(1..20 | ForEach-Object { @{ path="C:\t\$_"; bytes=5 } }) })
-            summary=[ordered]@{ total=1;clean=0;found=1;applied=0;skipped=0;errors=0;bytes=[int64]0 }; exitCode=0
+            summary=[ordered]@{ total=1;clean=0;found=1;applied=0;skipped=0;unverified=0;partial=0;errors=0;bytes=[int64]0 }; exitCode=0
         }
         $o2 = Join-Path ([IO.Path]::GetTempPath()) ("pm-report2-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".html")
         try { $null = New-PMHtmlReport -Run $many -OutPath $o2; return ((Get-Content $o2 -Raw) -match 'Showing 15 of 940') }

@@ -24,7 +24,7 @@ function Get-StaleAppCandidates {
     $root = Get-StaleTempRoot -Context $Context
     $cut  = (Get-Date).AddDays(-$script:StaleDays)
     $out  = @()
-    foreach ($d in (Get-PMChildDirectory -Path $root)) {
+    foreach ($d in (Get-PMChildDirectory -Path $root -Critical)) {
         $named    = $script:StaleAppNames -contains $d.Name
         $prefixed = @($script:StaleAppPrefixes | Where-Object { $d.Name.StartsWith($_, 'OrdinalIgnoreCase') }).Count -gt 0
         if (-not ($named -or $prefixed)) { continue }

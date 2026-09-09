@@ -128,17 +128,84 @@ function Test-PMPathSafe {
 
 # --- filesystem readers (the test seam) -----------------------------------------------
 # Modules read state ONLY through these, so tests can fake a tree without touching a disk.
+#
+# The readers RECORD what they could not read instead of silently returning less. That
+# distinction is the whole point: a reader that swallows an access error turns "I could not
+# look" into "there is nothing there", and the module then reports Clean while blind. It
+# happened on the first SYSTEM run of this tool: SYSTEM refuses to traverse a cross-volume
+# junction created by a less-privileged user ("the path cannot be traversed because it
+# contains an untrusted mount point"), and plex-bif-orphans cheerfully reported a clean
+# machine while 28 orphans sat on the other side of it.
+#
+# The counter lives in the module's own child scope, so Invoke-PMModulePhase reads it back
+# out and the dispatcher decides what to do. Modules do not have to remember anything.
+
+$script:PMReadErrors = @()          # anything unreadable: partial coverage
+$script:PMCriticalReadErrors = @()  # a read the module said its ANSWER depends on
+
+function Clear-PMReadErrors { $script:PMReadErrors = @(); $script:PMCriticalReadErrors = @() }
+function Get-PMReadErrorCount { @($script:PMReadErrors).Count }
+function Get-PMCriticalReadErrorCount { @($script:PMCriticalReadErrors).Count }
+function Get-PMReadErrorSample {
+    $e = @($script:PMCriticalReadErrors) + @($script:PMReadErrors)
+    if (-not $e.Count) { return '' }
+    return [string]$e[0].Exception.Message
+}
+
+# -Critical marks a read whose FAILURE INVALIDATES THE ANSWER: the module's own root, the one
+# place it must be able to see to say "clean" and mean it. Incidental probes leave it off.
+#
+# The distinction is not pedantry, it is what keeps the control believable. The first SYSTEM run
+# after error-tracking went in flagged vs-installer-scratch as unverified because one PyInstaller
+# _MEI directory was locked by a running app - a permanent, benign, weekly red. A check that
+# reddens for a benign reason trains you to ignore red, which costs more than the check gains.
+# Non-critical failures are still counted and still shown, as partial coverage.
+
+function Add-PMReadError {
+    param($Errors, [switch]$Critical)
+    if (-not $Errors) { return }
+    $script:PMReadErrors += @($Errors)
+    if ($Critical) { $script:PMCriticalReadErrors += @($Errors) }
+}
 
 function Get-PMChildDirectory {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [switch]$Critical)
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    @(Get-ChildItem -LiteralPath $Path -Force -Directory -ErrorAction SilentlyContinue)
+    $ev = $null
+    $r = @(Get-ChildItem -LiteralPath $Path -Force -Directory -ErrorAction SilentlyContinue -ErrorVariable ev)
+    Add-PMReadError -Errors $ev -Critical:$Critical
+    return $r
 }
 
 function Get-PMChildFile {
-    param([Parameter(Mandatory)][string]$Path, [string]$Filter = '*', [switch]$Recurse)
+    param([Parameter(Mandatory)][string]$Path, [string]$Filter = '*', [switch]$Recurse, [switch]$Critical)
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
-    @(Get-ChildItem -LiteralPath $Path -Force -File -Filter $Filter -Recurse:$Recurse -ErrorAction SilentlyContinue)
+    $ev = $null
+    $r = @(Get-ChildItem -LiteralPath $Path -Force -File -Filter $Filter -Recurse:$Recurse -ErrorAction SilentlyContinue -ErrorVariable ev)
+    Add-PMReadError -Errors $ev -Critical:$Critical
+    return $r
+}
+
+function Resolve-PMReparsePoint {
+    <#
+        Follow a junction/symlink to its real target, once.
+
+        Needed because this tool runs as SYSTEM, and SYSTEM will NOT traverse a cross-volume
+        junction created by a less-privileged user - Windows blocks it as a symlink-attack
+        defence. Scanning the resolved target instead sidesteps the block without weakening
+        anything: the path guard still applies, and the module declares the resolved root.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    try {
+        $i = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $t = $i.Target
+            if ($t -is [array]) { $t = $t[0] }
+            if ($t -and (Test-Path -LiteralPath $t)) { return [string]$t }
+        }
+    } catch {}
+    return $Path
 }
 
 function Test-PMPath { param([Parameter(Mandatory)][AllowEmptyString()][string]$Path)

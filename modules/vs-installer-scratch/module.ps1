@@ -21,7 +21,9 @@ function Get-VsScratchCandidates {
     $cut = (Get-Date).AddHours(-24)
     $out = @()
 
-    foreach ($d in (Get-PMChildDirectory -Path $root)) {
+    # Critical: enumerating TEMP is the answer. The per-candidate probes below are NOT - one
+    # locked _MEI directory means that candidate is unknown, not that the sweep is blind.
+    foreach ($d in (Get-PMChildDirectory -Path $root -Critical)) {
         if ($d.Name -notmatch '^[a-z0-9]{8}\.[a-z0-9]{3}$') { continue }
         if ($d.LastWriteTime -ge $cut) { continue }
         # A random name alone is not evidence. Require the installer's own fingerprint, so a

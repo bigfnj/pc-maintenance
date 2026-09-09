@@ -35,13 +35,23 @@ function Invoke-PMModulePhase {
     )
     $entryPath = Join-Path $ModuleDir $Entry
     if (-not (Test-Path $entryPath)) { throw "module entry not found: $entryPath" }
+    # Returns the phase result AND how many reads failed while producing it. The read counter
+    # lives in this child scope and dies with it, so it has to be carried back out here; doing
+    # it centrally means no module can forget to report that it was reading blind.
     & {
         param($libDir, $entry, $ctx, $phase)
         Get-ChildItem $libDir -Filter *.ps1 -ErrorAction Stop | ForEach-Object { . $_.FullName }
         . $entry
-        switch ($phase) {
+        Clear-PMReadErrors
+        $result = switch ($phase) {
             'Test' { Test-PMModule -Context $ctx }
             'Repair' { Repair-PMModule -Context $ctx }
+        }
+        [pscustomobject]@{
+            Result            = $result
+            ReadErrors        = (Get-PMReadErrorCount)
+            CriticalReadErrors = (Get-PMCriticalReadErrorCount)
+            ReadErrorSample   = (Get-PMReadErrorSample)
         }
     } $LibDir $entryPath $Context $Phase
 }

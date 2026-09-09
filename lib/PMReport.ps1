@@ -63,6 +63,7 @@ function Get-PMStatusPresentation {
         'reported' { @{ Role = 'warning';  Icon = '!';    Word = 'Found' } }
         'applied'  { @{ Role = 'good';     Icon = 'OK';   Word = 'Cleaned' } }
         'skipped'  { @{ Role = 'muted';    Icon = '--';   Word = 'Skipped' } }
+        'unverified' { @{ Role = 'serious'; Icon = '/!'; Word = 'Could not check' } }
         'error'    { @{ Role = 'critical'; Icon = 'X';    Word = 'Error' } }
         default    { @{ Role = 'muted';    Icon = '?';    Word = $Status } }
     }
@@ -146,6 +147,7 @@ h2 { font-size:14px; font-weight:600; text-transform:uppercase; letter-spacing:0
 .badge .ic { font-size:11px; font-weight:700; letter-spacing:0.02em; }
 .d-good{background:var(--good)} .d-warning{background:var(--warning)}
 .d-critical{background:var(--critical)} .d-muted{background:var(--muted)}
+.d-serious{background:var(--serious)}
 .card .size { margin-left:auto; font-weight:600; font-size:16px; }
 .card .detail { color:var(--ink-2); font-size:14px; margin:8px 0 0; }
 .meter { height:6px; border-radius:3px; background:var(--bar-track); margin-top:14px; overflow:hidden; }
@@ -217,6 +219,8 @@ function New-PMHtmlReport {
         @{ L = 'Found';       V = $s.found },
         @{ L = 'Acted on';    V = $s.applied },
         @{ L = 'Skipped';     V = $s.skipped },
+        @{ L = 'Unverified';  V = $s.unverified },
+        @{ L = 'Unreadable';  V = $s.partial },
         @{ L = 'Errors';      V = $s.errors })) {
         [void]$sb.AppendLine('<div class="tile"><p class="label">' + $t.L + '</p><p class="value">' + $t.V + '</p></div>')
     }

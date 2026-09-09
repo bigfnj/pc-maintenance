@@ -7,11 +7,24 @@
 #>
 
 function Get-PlexMediaRoot {
+    <#
+        Resolves the junction. Plex's Media directory is very commonly moved to another volume
+        and left behind as a junction, which is what happened on the box this was written for
+        (Media -> E:\PlexMedia).
+
+        That matters because this runs as SYSTEM, and Windows will NOT let a privileged process
+        traverse a cross-volume junction created by a less-privileged user: the read fails with
+        "the path cannot be traversed because it contains an untrusted mount point". Scanning the
+        resolved target instead sidesteps the block without weakening anything, since the path
+        guard still applies against whatever root this returns.
+    #>
     param([Parameter(Mandatory)][hashtable]$Context)
-    if ($Context.UserProfile) {
-        return (Join-Path $Context.UserProfile 'AppData\Local\Plex Media Server\Media')
+    $p = if ($Context.UserProfile) {
+        Join-Path $Context.UserProfile 'AppData\Local\Plex Media Server\Media'
+    } else {
+        Join-Path $env:LOCALAPPDATA 'Plex Media Server\Media'
     }
-    return (Join-Path $env:LOCALAPPDATA 'Plex Media Server\Media')
+    return (Resolve-PMReparsePoint -Path $p)
 }
 
 function Get-PlexOrphanCandidates {
@@ -19,7 +32,9 @@ function Get-PlexOrphanCandidates {
     $root = Get-PlexMediaRoot -Context $Context
     if (-not (Test-PMPath -Path $root)) { return @() }
     $out = @()
-    foreach ($f in (Get-PMChildFile -Path $root -Filter '*.tmp' -Recurse)) {
+    # Critical: this single recursive scan IS the module's answer. If it fails the module knows
+    # nothing, which is a different thing from knowing there is nothing.
+    foreach ($f in (Get-PMChildFile -Path $root -Filter '*.tmp' -Recurse -Critical)) {
         # The pairing IS the rule. A .tmp whose finished sibling is absent may be a generation
         # still running, so it survives; only a temp file the real artifact has superseded goes.
         $base = $f.FullName.Substring(0, $f.FullName.Length - 4)
