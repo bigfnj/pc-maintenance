@@ -383,22 +383,60 @@ It 'Expand-PMRoot expands against the INTERACTIVE user, not the process' {
 }
 
 Write-Host "`n== each forbidden pattern is pinned ==" -ForegroundColor Cyan
+# Each case carries its OWN roots. The table used to share a fixed pair that contained neither a
+# UNC path nor a \\?\ path, so those rows would have passed with no pattern added at all - the
+# root check would have rejected them and the test would have proved nothing.
 foreach ($case in @(
-    @{ P = 'C:\Users\Someone\AppData\Local\Temp\wsl\ext4';          N = 'wsl' }
-    @{ P = 'C:\Users\Someone\AppData\Local\Temp\x\site-packages\y'; N = 'site-packages' }
-    @{ P = 'C:\Users\Someone\Desktop\thing';                        N = 'Desktop' }
-    @{ P = 'C:\Users\Someone\Pictures\thing';                       N = 'Pictures' }
-    @{ P = 'C:\Users\Someone\Videos\thing';                         N = 'Videos' }
-    @{ P = 'C:\Users\Someone\Music\thing';                          N = 'Music' }
-    @{ P = 'C:\Users\Someone\Downloads\thing';                      N = 'Downloads (where this tool writes its reports)' }
-    @{ P = 'C:\Program Files (x86)\App\sub';                        N = 'Program Files (x86)' })) {
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\wsl\ext4';          N = 'a local wsl mount point';        R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\x\site-packages\y'; N = 'site-packages';                  R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\Desktop\thing';                        N = 'Desktop';                       R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\Pictures\thing';                       N = 'Pictures';                      R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\Videos\thing';                         N = 'Videos';                        R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\Music\thing';                          N = 'Music';                         R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\Downloads\thing';                      N = 'Downloads (where reports land)'; R = @('C:\Users\Someone') }
+    @{ P = 'C:\Program Files (x86)\App\sub';                        N = 'Program Files (x86)';           R = @('C:\Program Files (x86)') }
+    # OneDrive Known Folder Move: the Windows 11 default, so for most people these ARE the real
+    # Documents and Desktop. Measured safe before the pattern existed.
+    @{ P = 'C:\Users\Someone\OneDrive\Documents\tax';               N = 'OneDrive Documents (KFM)';      R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\OneDrive - Contoso\Desktop\thing';     N = 'OneDrive for Business Desktop'; R = @('C:\Users\Someone') }
+    # Credentials and keys. AppData\Roaming was uncovered entirely.
+    @{ P = 'C:\Users\Someone\AppData\Roaming\.ssh\id_ed25519';      N = 'Roaming .ssh';                  R = @('C:\Users\Someone\AppData\Roaming') }
+    @{ P = 'C:\Users\Someone\AppData\Roaming\.aws\credentials';     N = 'Roaming .aws';                  R = @('C:\Users\Someone\AppData\Roaming') }
+    @{ P = 'C:\Users\Someone\AppData\Roaming\Microsoft\Crypto\RSA'; N = 'Roaming Microsoft\Crypto';      R = @('C:\Users\Someone\AppData\Roaming') }
+    @{ P = 'C:\Users\Someone\.ssh\config';                          N = 'a profile-level .ssh';          R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\.aws\credentials';                     N = 'a profile-level .aws';          R = @('C:\Users\Someone') }
+    # UNC in every spelling. These need roots that CONTAIN them or the test is vacuous.
+    @{ P = '\\wsl$\Ubuntu\home\me\stuff';                           N = 'the wsl$ UNC share';            R = @('\\wsl$\Ubuntu') }
+    @{ P = '\\wsl.localhost\Ubuntu\home\me\s';                      N = 'the wsl.localhost UNC share';   R = @('\\wsl.localhost\Ubuntu') }
+    @{ P = '\\fileserver\share\folder\thing';                       N = 'an ordinary UNC share';         R = @('\\fileserver\share') }
+    # The long-path prefixes, which defeat every drive-anchored pattern at once.
+    @{ P = '\\?\C:\Windows\System32\config';                        N = 'the long-path prefix (caught by the UNC rule)';     R = @('\\?\C:\Windows') }
+    @{ P = '\\.\C:\Windows\System32';                               N = 'the device prefix (caught by the UNC rule)';        R = @('\\.\C:\Windows') })) {
     $k = $case
-    It "refuses $($k.N)" { -not (Test-PMPathSafe -Path $k.P -Roots @('C:\Users\Someone', 'C:\Program Files (x86)')) }
+    It "refuses $($k.N)" { -not (Test-PMPathSafe -Path $k.P -Roots $k.R) }
 }
 It 'refuses a sibling whose name merely starts with the root name' {
     # The prefix check and the root-itself check used to cover for each other, so breaking either
     # one alone left the suite green while C:\...\TempEvil became deletable.
     -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\TempEvil\x' -Roots @('C:\Users\Someone\AppData\Local\Temp'))
+}
+
+Write-Host "`n== and the paths the modules actually sweep are still SAFE ==" -ForegroundColor Cyan
+# Positive controls. Without these, an over-broad new pattern would forbid everything and the
+# whole suite above would still be green while the tool silently stopped deleting anything.
+foreach ($ok in @(
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\abcd1234.xyz';                  N = 'a VS installer extraction';    R = @('C:\Users\Someone\AppData\Local\Temp') }
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\Adobe';                         N = 'stale app scratch';            R = @('C:\Users\Someone\AppData\Local\Temp') }
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\claude\d---x\1111-2222';        N = 'an agent session directory';   R = @('C:\Users\Someone\AppData\Local\Temp\claude') }
+    @{ P = 'E:\PlexMedia\Localhost\0\abc.bundle\Contents\Indexes\index-sd.bif.tmp'; N = 'a Plex preview temp';      R = @('E:\PlexMedia') })) {
+    $g = $ok
+    It "still allows $($g.N)" { Test-PMPathSafe -Path $g.P -Roots $g.R }
+}
+It 'still allows the uninstaller to delete its own payload root' {
+    # Uninstall-PcMaintenance.ps1 is the ONLY caller passing operator input and the only one using
+    # MinDepth 2. A new pattern that caught C:\ProgramData\... would not break a module, it would
+    # make uninstall refuse to run - a far less obvious failure.
+    Test-PMPathSafe -Path 'C:\ProgramData\PcMaintenance' -Roots @('C:\ProgramData') -MinDepth 2
 }
 
 Write-Host "`n== Get-PMPathSize ==" -ForegroundColor Cyan

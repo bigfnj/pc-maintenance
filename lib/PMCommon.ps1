@@ -88,8 +88,29 @@ $script:PMForbiddenPathPatterns = @(
     '^[A-Za-z]:\\Windows($|\\)'
     '^[A-Za-z]:\\Program Files( \(x86\))?($|\\)'
     '^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|Pictures|Videos|Music|Downloads)($|\\)'
+    # Known Folder Move is the Windows 11 default, so the REAL Documents/Desktop/Pictures for
+    # most people live under OneDrive and the pattern above never sees them. Measured before
+    # this line existed: C:\Users\X\OneDrive\Documents\tax returned safe.
+    '^[A-Za-z]:\\Users\\[^\\]+\\OneDrive[^\\]*($|\\)'
+    # Anything a credential or a key lives in. AppData\Roaming was uncovered entirely.
+    '\\AppData\\Roaming\\(\.ssh|\.aws|\.azure|\.kube|\.gnupg|Microsoft\\Crypto|Microsoft\\Protect)($|\\)'
+    '\\\.ssh($|\\)'
+    '\\\.aws($|\\)'
+    # Anything beginning \\, which is three separate dangers at once:
+    #   * UNC shares. Forbidden outright rather than by adjusting MinDepth: this is a
+    #     local-machine housekeeping tool, no module has business on a share, and a future
+    #     one that did would have to remove this line deliberately. MinDepth is a poor
+    #     defence there anyway - \\server\share\folder already counts as three segments.
+    #   * the \\?\ long-path prefix, which otherwise defeats every ^[A-Za-z]:\\-anchored
+    #     pattern above AT ONCE, silently switching most of this list off.
+    #   * the \\.\ device prefix, same reasoning.
+    # These were briefly two patterns. The second could never fire: every path it matched
+    # already began \\ and was caught here first, so it was a guard no input could reach.
+    '^\\\\'
     '\\DockerDesktop($|\\)'
     '\\docker\\volumes($|\\)'
+    # \wsl\ only ever matched a directory literally named "wsl". The real WSL shares are UNC and
+    # are covered by the ^\\\\ rule above; this stays for a local mount point of that name.
     '\\wsl\\'
     '\\\.git($|\\)'
     '\\site-packages($|\\)'
