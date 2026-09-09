@@ -31,7 +31,8 @@ param(
     [switch]$Apply,
     [string]$PayloadRoot,
     [string]$ManifestPath,
-    [string[]]$Only
+    [string[]]$Only,
+    [switch]$NoReport
 )
 
 # $PayloadRoot is resolved HERE, not as a param default. Under Windows PowerShell 5.1 --- which
@@ -53,7 +54,7 @@ $modulesDir  = Join-Path $PayloadRoot 'modules'
 $logsDir     = Join-Path $PayloadRoot 'logs'
 if (-not $ManifestPath) { $ManifestPath = Join-Path $PayloadRoot 'pcmaintenance.manifest.json' }
 
-foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1') { . (Join-Path $libDir $f) }
+foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1', 'PMReport.ps1') { . (Join-Path $libDir $f) }
 
 $runId = New-PMRunId
 New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
@@ -165,6 +166,21 @@ try {
         $json | Set-Content -LiteralPath (Join-Path $logsDir "run-$runId.json") -Encoding UTF8
         $json | Set-Content -LiteralPath (Join-Path $logsDir 'latest.json') -Encoding UTF8
     } catch { Write-PMLog "could not write run json: $($_.Exception.Message)" 'ERROR' }
+
+    # The human-facing artifact, dropped where the owner will actually see it. Wrapped so a
+    # report failure can never turn a clean sweep into a failed run: the sweep is the work, the
+    # report is the delivery, and losing the delivery is worth a WARN, not an exit code.
+    if (-not $NoReport) {
+        try {
+            $dl = Get-PMDownloadsPath -UserSid $user.Sid -UserProfile $user.Profile
+            $stamp = (Get-Date -Format 'yyyy-MM-dd HHmmss')
+            $reportPath = Join-Path $dl ("PC-Maintenance Report - $stamp.html")
+            $null = New-PMHtmlReport -Run $runObj -OutPath $reportPath
+            Write-PMLog "report: $reportPath" 'OK'
+        } catch {
+            Write-PMLog "could not write the HTML report: $($_.Exception.Message)" 'WARN'
+        }
+    }
 
     Write-PMLog ('=== SUMMARY total={0} clean={1} found={2} applied={3} skipped={4} errors={5} freed={6} (exit {7}) ===' -f `
             $summary.total, $summary.clean, $summary.found, $summary.applied, $summary.skipped,

@@ -15,7 +15,7 @@ param()
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
 $libDir = Join-Path $root 'lib'
-foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1') { . (Join-Path $libDir $f) }
+foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1', 'PMReport.ps1') { . (Join-Path $libDir $f) }
 
 $script:Pass = 0; $script:Fail = 0
 function It {
@@ -142,6 +142,62 @@ try {
     }
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "`n== HTML report ==" -ForegroundColor Cyan
+$fakeRun = [ordered]@{
+    runId = 'test-run'; startedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    version = '0.0.0'; mode = 'report'
+    modules = @(
+        [ordered]@{ id = 'mod-clean'; status = 'clean'; detail = 'nothing found'; bytes = [int64]0; count = 0; items = @() },
+        [ordered]@{ id = 'mod-found'; status = 'reported'; detail = 'two things'; bytes = [int64]2048; count = 2
+                    items = @(@{ path = 'C:\t\a & <b>"q"'; bytes = 1024; ageDays = 5 }, @{ path = 'C:\t\b'; bytes = 1024 }) }
+    )
+    summary = [ordered]@{ total = 2; clean = 1; found = 1; applied = 0; skipped = 0; errors = 0; bytes = [int64]0 }
+    exitCode = 0
+}
+$reportOut = Join-Path ([IO.Path]::GetTempPath()) ("pm-report-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".html")
+try {
+    $null = New-PMHtmlReport -Run $fakeRun -OutPath $reportOut
+    $html = Get-Content -LiteralPath $reportOut -Raw
+
+    It 'writes a file'                    { Test-Path -LiteralPath $reportOut }
+    It 'is a complete html document'      { $html -match '(?i)^<!doctype html>' -and $html -match '(?i)</html>\s*$' }
+    It 'renders one card per module'      { ([regex]::Matches($html, '<div class="card">')).Count -eq 2 }
+    It 'leads with exactly one hero'      { ([regex]::Matches($html, 'class="hero"')).Count -eq 1 }
+    It 'escapes html metacharacters in paths' {
+        # A path containing & < > " must not reach the document raw, or one oddly-named
+        # directory silently breaks every card after it.
+        ($html -match 'a &amp; &lt;b&gt;&quot;q&quot;') -and ($html -notmatch 'a & <b>"q"')
+    }
+    It 'is self-contained: no external fetch' {
+        # The report is opened offline, from Downloads, possibly months later. Any CDN,
+        # webfont or remote image would render it broken exactly when it is needed.
+        return ($html -notmatch '(?i)(src|href)\s*=\s*"\s*https?:') -and ($html -notmatch '(?i)@import') -and
+               ($html -notmatch '(?i)url\(\s*[''"]?https?:')
+    }
+    It 'declares dark under BOTH the media query and the theme scope' {
+        ($html -match 'prefers-color-scheme:\s*dark') -and ($html -match ':root\[data-theme="dark"\]')
+    }
+    It 'states the mode so a report run is never mistaken for a cleanup' { $html -match 'REPORT ONLY' }
+    It 'says how many it showed when the list is capped' {
+        $many = [ordered]@{
+            runId='r'; startedUtc=(Get-Date).ToUniversalTime().ToString('o'); version='0'; mode='report'
+            modules=@([ordered]@{ id='m'; status='reported'; detail='d'; bytes=[int64]100; count=940
+                                  items=@(1..20 | ForEach-Object { @{ path="C:\t\$_"; bytes=5 } }) })
+            summary=[ordered]@{ total=1;clean=0;found=1;applied=0;skipped=0;errors=0;bytes=[int64]0 }; exitCode=0
+        }
+        $o2 = Join-Path ([IO.Path]::GetTempPath()) ("pm-report2-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".html")
+        try { $null = New-PMHtmlReport -Run $many -OutPath $o2; return ((Get-Content $o2 -Raw) -match 'Showing 15 of 940') }
+        finally { Remove-Item -LiteralPath $o2 -Force -ErrorAction SilentlyContinue }
+    }
+} finally { Remove-Item -LiteralPath $reportOut -Force -ErrorAction SilentlyContinue }
+
+It 'Downloads resolution never returns empty' {
+    # Degrades profile -> TEMP rather than failing: a missing report must not look like a
+    # failed sweep, and an empty path would throw inside Join-Path.
+    $p = Get-PMDownloadsPath -UserSid 'S-1-5-21-nonexistent' -UserProfile 'C:\Nope\NoSuchUser'
+    return (-not [string]::IsNullOrWhiteSpace($p))
 }
 
 Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
