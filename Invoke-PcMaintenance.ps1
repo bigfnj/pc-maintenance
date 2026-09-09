@@ -5,15 +5,15 @@
     removes only what is both permitted and proven.
 
 .DESCRIPTION
-    Borrowed from preference-guard's dispatcher, with the default inverted. preference-guard
-    repairs by default and takes -DryRun to hold back; this tool REPORTS by default and takes
+    Borrowed from a sibling project's dispatcher, with the default inverted. That one repairs by
+    default and takes -DryRun to hold back; this tool REPORTS by default and takes
     -Apply to act, because the failure modes are not symmetric. A preference left unrepaired is
     an inconvenience you notice; a file deleted wrongly is gone.
 
     Deletion needs BOTH -Apply here AND AutoApply=$true in the module's own manifest, and every
     path additionally passes the hard-coded guard in PMCommon before it can be removed.
 
-    There is no backup phase. preference-guard snapshots a registry key before writing it and
+    There is no backup phase. The original snapshots a registry key before writing it and
     can replay it on uninstall; nothing can snapshot 67 GB of scratch. The audit trail replaces
     it: every run records the full list of paths considered, with sizes and the reason each was
     kept or removed, in logs/run-<id>.json.

@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
-    Non-destructive test runner for pc-maintenance. No Pester dependency, same spirit as
-    preference-guard's tests/Invoke-Tests.ps1.
+    Non-destructive test runner for pc-maintenance. No Pester dependency, in the same spirit as
+    the runner in the project this borrows its framework from.
 
     Nothing here deletes anything: the guard tests assert on Test-PMPathSafe directly, and the
     removal tests run against a throwaway tree under the caller's TEMP with -WhatIfOnly.
