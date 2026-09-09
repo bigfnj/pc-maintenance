@@ -7,12 +7,11 @@ Everything here came out of the 2026-09-09 audit round unless noted.
 
 **Coverage before change, latent-safety before capability, design decisions last.**
 
-The modules have no behavioural tests at all, so item 1 comes first: every other change on this
-list touches code that nothing currently verifies, and doing them in the other order means fixing
-guards while unable to tell whether a module still works. After that, the path-pattern gaps (2)
-are a single batch in a single file with one test shape, and they are worth closing *before* a new
-module makes them reachable rather than after. Items 3 and 4 are settled: 3 shipped, 4 was closed
-as won't-fix once the threat model was pinned down.
+Items 1 through 4 are closed, and the order held. The module tests (1) had to come first because
+every other change touched code that nothing verified behaviourally, and writing them found two
+real traps on their own. The path-pattern gaps (2) were then a single batch in a single file with
+one test shape, closed before a new module made them reachable rather than after. 3 shipped; 4
+was closed as won't-fix once the threat model was pinned down.
 
 Nothing still open here is reachable through the four shipped modules today. That is the reason
 none of it is urgent, and also the reason it is easy to leave until a fifth module quietly makes
@@ -20,41 +19,55 @@ it reachable.
 
 ---
 
-## 1. Three of the four modules have no behavioural tests
+## 1. ~~Three of the four modules have no behavioural tests~~ DONE 2026-09-09
 
-**Why first:** it is the thinnest coverage in the tree, and it gates honest work on everything
-else. `vs-installer-scratch`'s three-condition identification rule decides whether tens
-of gigabytes of somebody's TEMP get deleted, and it is currently checked only by a regex over its
-own source text. The same goes for `plex-bif-orphans`' pairing rule and `stale-app-temp`'s
-allowlist and age floor. `agent-scratchpads` got real fixture tests when it was enabled, so it is
-the shape to copy for the other three.
+Shipped. Each of the three now runs against a real fixture tree in TEMP with controlled
+timestamps, and the tests assert exactly which paths come back AND which do not. Both
+source-text greps are retired: the `Count` / capped-`Items` grep became a 30-orphan fixture
+asserting `Count` 30 with `Items` capped at 25, and the `-Critical` grep became four tests that
+point each module at a directory which exists but cannot be listed and assert
+`Get-PMCriticalReadErrorCount` is non-zero. The old grep was satisfied by the literal string
+appearing anywhere in the file, including inside a comment.
 
-**Shape:** a fixture tree per module, run `Test-PMModule` against it, assert exactly which paths
-come back. That also retires the three source-text greps in the suite, which pass whether or not
-the thing they describe still works.
+Ten selection conditions mutation-tested individually. 111 tests -> 137.
 
-**Watch for:** three of the four now delete, so a fixture test must assert exactly which paths
-come back, not merely that some do.
+Two traps found while writing them, both worth keeping:
 
-## 2. The path guard reads broader than it is
+- **`fl` is the built-in alias for `Format-List`, and PowerShell resolves aliases BEFORE
+  functions.** A fixture helper named `Fl` silently formatted a string instead of creating a
+  file: no error, no file, and the formatter's output leaked into the fixture's return value.
+  Renamed to `Add-FixtureDir` / `Add-FixtureFile` with the reason in a comment.
+- **A test that could not fail.** The first `.tmpx` case survived mutating `EndsWith('.tmp')` to
+  a loose match, because `weird.bif.tmpx` strips to `weird.bif.` with a trailing dot and the
+  pairing rule rejects it anyway. The case that actually discriminates is `chunk.tmp.bif` beside
+  a real `chunk.tmp`: a loose rule strips four characters, finds the partner present, and deletes
+  a finished preview. Mutation testing is what told the difference. Reading the test did not.
 
-Four gaps, all measured, none reachable today because every path handed to `Remove-PMPath` comes
-from `Get-ChildItem`'s `.FullName`. Do them as one batch: same file, same test shape, one commit.
+Cleanup also needs care: a Deny ACE is how you make a directory that EXISTS but cannot be LISTED,
+and removing it again must go through `icacls /reset`, not `Set-Acl`, which wants
+SeSecurityPrivilege and strands an undeletable directory behind it.
 
-- **OneDrive Known Folder Move.** `'^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|...)'` only
-  matches a direct child of the profile. KFM is the Windows 11 default, so the real Documents,
-  Desktop and Pictures sit under `...\OneDrive\...` and are unprotected. Measured:
-  `C:\Users\Someone\OneDrive\Documents\tax` returns **safe**.
-- **UNC forms.** `'\\wsl\\'` matches a directory literally named `wsl`, not `\\wsl$\Ubuntu\...`
-  or `\\wsl.localhost\...`, both of which measure **safe**. `MinDepth = 3` is also much weaker on
-  a share, where `\\server\share\folder` is already three segments.
-- **The `\\?\` prefix** defeats every `^[A-Za-z]:\\`-anchored pattern at once, so the entire
-  forbidden list would silently stop applying if long-path handling were ever added.
-- **`AppData\Roaming` is uncovered entirely** (`.ssh`, `.aws`, browser profiles,
-  `Microsoft\Crypto\RSA`).
+## 2. ~~The path guard reads broader than it is~~ DONE 2026-09-09
 
-**Add one test per pattern.** The suite already does this for the current entries; the gap is that
-the entries themselves are incomplete, not that they are untested.
+All four gaps closed, each pattern mutation-tested individually, plus five positive controls so
+an over-broad pattern cannot pass by forbidding everything while the tool silently stops deleting.
+Verified end to end with a real `Uninstall -RemoveFiles` then `Install`, because the uninstaller
+is the only caller whose `-Path` is operator input rather than an enumerated `.FullName`, and a
+new pattern catching `C:\ProgramData\...` would not break a module, it would make uninstall
+refuse to run.
+
+**The `MinDepth` weakness on shares is now unreachable rather than fixed.**
+`\\server\share\folder` already counts as three segments, so `MinDepth = 3` never protected a
+share root. Forbidding UNC outright means nothing can reach that path. If a future module ever
+needs to sweep a share it has to delete the UNC pattern deliberately, and **that** is the moment
+to fix the segment counting, not before.
+
+⚠ One of the four patterns could never fire, which is the finding worth keeping. `'^\\\\[\?\.]\\'`
+was written to catch the `\\?\` long-path prefix, but every path it matched already began `\\`
+and was caught by the UNC rule one line above. The suite was green with it present and green with
+it removed; only the mutation run exposed it. A guard no input can reach is worse than no guard,
+because it reads like coverage in review and nobody looks again. Folded into the UNC rule with
+the reasoning in a comment.
 
 ## 3. ~~A liveness check so `agent-scratchpads` can act~~ DONE 2026-09-09
 
