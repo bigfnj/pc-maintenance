@@ -145,17 +145,6 @@ It 'exactly the three proven-mechanical modules declare AutoApply' {
     $auto = @($modDirs | Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } | ForEach-Object { $_.Name } | Sort-Object)
     return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
 }
-It 'every module reports a true Count alongside a possibly-capped Items' {
-    # Two modules cap Items so a 6,935-orphan run does not bloat the run json. Without a
-    # separate Count the dispatcher would log the CAP and disagree with the module's own
-    # Detail string, which is the "two numbers, one of them decorative" trap.
-    foreach ($d in $modDirs) {
-        $src = Get-Content -LiteralPath (Join-Path $d.FullName 'module.ps1') -Raw
-        if ($src -notmatch 'Clean\s+=\s+\$false') { return $false }
-        if ($src -notmatch 'Count\s+=\s+@\(\$items\)\.Count') { return $false }
-    }
-    return $true
-}
 It 'every module in the manifest exists on disk' {
     $m = Get-PMManifest -Path (Join-Path $root 'pcmaintenance.manifest.json')
     foreach ($e in $m.modules) { if (-not (Test-Path (Join-Path $root "modules\$($e.id)"))) { return $false } }
@@ -197,15 +186,6 @@ It 'only a CRITICAL read failure invalidates the answer' {
     try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ }
     try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ -Critical }
     return ((Get-PMReadErrorCount) -eq 2 -and (Get-PMCriticalReadErrorCount) -eq 1)
-}
-It 'every shipped module marks its load-bearing read Critical' {
-    # A module whose root read is not Critical can report clean while blind, which is the whole
-    # bug. Cheap to forget, so it is pinned rather than trusted.
-    foreach ($d in (Get-ChildItem (Join-Path $root 'modules') -Directory)) {
-        $src = Get-Content -LiteralPath (Join-Path $d.FullName 'module.ps1') -Raw
-        if ($src -notmatch '-Critical') { return $false }
-    }
-    return $true
 }
 It 'the dispatcher checks unverified BEFORE it checks clean' {
     # Order is the whole guarantee. If the clean branch ran first, a module that could not read
@@ -760,6 +740,326 @@ It 'agent-scratchpads is now one of three modules allowed to act' {
         Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } |
         ForEach-Object { $_.Name } | Sort-Object)
     return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
+}
+
+Write-Host "`n== module selection rules, against real fixture trees ==" -ForegroundColor Cyan
+
+function Invoke-PMModuleTest {
+    <#
+        Run ONE module's Test-PMModule against a fixture root, isolated.
+
+        All four modules define Test-PMModule and Repair-PMModule, and agent-scratchpads is already
+        dot-sourced at script scope. Dot-sourcing a second at script scope would silently overwrite
+        it, so each call gets its own & {} scope - the same isolation lib\PMModule.ps1 uses in
+        production for the same reason.
+
+        The root-resolver override is installed by NAME after the module is dot-sourced, so it wins
+        the lookup. Returns the module's result plus the critical-read count, which is how the
+        "blind is not clean" contract gets asserted behaviourally instead of by grepping for a flag.
+    #>
+    param([string]$ModuleId, [string]$RootResolver, [string]$FixtureRoot)
+    & {
+        param($libDir, $entry, $resolver, $fixture)
+        Get-ChildItem $libDir -Filter *.ps1 | ForEach-Object { . $_.FullName }
+        . $entry
+        Set-Item -Path "function:$resolver" -Value ([scriptblock]::Create("param(`$Context) '$fixture'"))
+        Clear-PMReadErrors
+        $r = Test-PMModule -Context @{ UserProfile = $null }
+        [pscustomobject]@{ Result = $r; CriticalReads = (Get-PMCriticalReadErrorCount) }
+    } (Join-Path $script:RepoRoot 'lib') (Join-Path $script:RepoRoot "modules\$ModuleId\module.ps1") $RootResolver $FixtureRoot
+}
+
+function Get-PMPicks {
+    # Leaf names of what a module selected, which is what makes -contains assertions readable.
+    param([string]$ModuleId, [string]$RootResolver, [string]$FixtureRoot)
+    $o = Invoke-PMModuleTest -ModuleId $ModuleId -RootResolver $RootResolver -FixtureRoot $FixtureRoot
+    return @(@($o.Result.Items) | ForEach-Object { Split-Path $_.path -Leaf })
+}
+
+function New-PMUnreadableDir {
+    <#
+        A directory that EXISTS but cannot be LISTED. Needed because a module takes an early
+        "no root" return on a missing path, so a missing directory proves nothing about the
+        critical-read contract.
+
+        Returns $null if the condition could not be produced, so the caller SKIPs loudly rather
+        than passing vacuously. Cleanup goes through icacls /reset, NOT Set-Acl: removing a deny
+        ACE via Set-Acl wants SeSecurityPrivilege and leaves an undeletable directory behind.
+    #>
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-deny-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'inside.txt') -Value 'x' -Encoding UTF8
+    try {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = Get-Acl -LiteralPath $d
+        $acl.SetAccessRuleProtection($true, $true)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $me, [Security.AccessControl.FileSystemRights]::ListDirectory,
+            'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+        Set-Acl -LiteralPath $d -AclObject $acl -ErrorAction Stop
+    } catch { Remove-PMUnreadableDir $d; return $null }
+    # Verify the condition actually holds rather than assuming the ACL took.
+    $ev = $null
+    $null = @(Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue -ErrorVariable ev)
+    if (-not $ev -or -not (Test-Path -LiteralPath $d)) { Remove-PMUnreadableDir $d; return $null }
+    return $d
+}
+function Remove-PMUnreadableDir {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
+    $null = icacls $Path /reset /T /C 2>&1
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- vs-installer-scratch -------------------------------------------------------------
+function New-PMVsTree {
+    <#
+        Directory timestamps are stamped LAST, after every file is written. Creating a file bumps
+        its parent's LastWriteTime, and this module branches on the candidate directory's own
+        mtime - so stamping first would silently make every candidate look brand new.
+    #>
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("pm-vs-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $old = (Get-Date).AddDays(-3)
+    # NOT named Mk/Fl: `fl` is the built-in alias for Format-List, and PowerShell resolves
+    # aliases BEFORE functions, so `Fl $path` silently formatted a string instead of creating a
+    # file - no error, no file, and the formatter's output leaked into the fixture's return value.
+    function Add-FixtureDir($p) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+    function Add-FixtureFile($p) { Add-FixtureDir (Split-Path $p -Parent); Set-Content -LiteralPath $p -Value 'x' -Encoding UTF8 }
+
+    # the real thing: name shape + setup.exe + resources\app\ServiceHub + older than 24h
+    Add-FixtureDir (Join-Path $root 'abcd1234.xyz\resources\app\ServiceHub'); Add-FixtureFile (Join-Path $root 'abcd1234.xyz\setup.exe')
+    # near-miss: right name, setup.exe, NO ServiceHub
+    Add-FixtureFile (Join-Path $root 'bbbb2222.yyy\setup.exe')
+    # near-miss: right name, ServiceHub, NO setup.exe
+    Add-FixtureDir (Join-Path $root 'cccc3333.zzz\resources\app\ServiceHub')
+    # near-miss: full fingerprint but the name is not the installer's shape
+    Add-FixtureDir (Join-Path $root 'notavsname\resources\app\ServiceHub'); Add-FixtureFile (Join-Path $root 'notavsname\setup.exe')
+    # near-miss: correct in every way but too recent
+    Add-FixtureDir (Join-Path $root 'dddd4444.www\resources\app\ServiceHub'); Add-FixtureFile (Join-Path $root 'dddd4444.www\setup.exe')
+    # payload cache: a manifest SUBDIRECTORY (not a file) plus a real .vsix somewhere below
+    Add-FixtureDir (Join-Path $root 'PayloadCache\Microsoft.VisualStudio.Thing')
+    Add-FixtureFile (Join-Path $root 'PayloadCache\deep\pkg.vsix')
+    # payload-cache near-miss: manifest subdirectory but no .vsix anywhere
+    Add-FixtureDir (Join-Path $root 'NoVsixCache\Microsoft.VisualStudio.Thing')
+
+    foreach ($d in @('abcd1234.xyz','bbbb2222.yyy','cccc3333.zzz','notavsname','PayloadCache','NoVsixCache')) {
+        (Get-Item -LiteralPath (Join-Path $root $d)).LastWriteTime = $old
+    }
+    (Get-Item -LiteralPath (Join-Path $root 'dddd4444.www')).LastWriteTime = (Get-Date)
+    return $root
+}
+$vsPick = { param($r) Get-PMPicks -ModuleId 'vs-installer-scratch' -RootResolver 'Get-VsScratchRoot' -FixtureRoot $r }
+
+It 'vs: selects an extraction with the name shape, both fingerprint files, and age' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -contains 'abcd1234.xyz') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: rejects a right-named directory missing resources\app\ServiceHub' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -notcontains 'bbbb2222.yyy') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: rejects a right-named directory missing setup.exe' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -notcontains 'cccc3333.zzz') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: rejects the full fingerprint under a name that is not the installer shape' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -notcontains 'notavsname') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: rejects a correct extraction younger than the 24h floor' {
+    # The floor is what keeps it clear of an extraction still in flight.
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -notcontains 'dddd4444.www') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: selects a payload cache with a manifest subdirectory and a real .vsix' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -contains 'PayloadCache') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: rejects a manifest subdirectory with no .vsix below it' {
+    $r = New-PMVsTree
+    try { return ((& $vsPick $r) -notcontains 'NoVsixCache') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'vs: selects exactly two things and nothing else' {
+    # "assert exactly which paths come back" - a test that only checks the wanted ones would
+    # still pass if the module also swept half of TEMP.
+    $r = New-PMVsTree
+    try {
+        $p = @(& $vsPick $r) | Sort-Object
+        return (($p -join ',') -eq 'abcd1234.xyz,PayloadCache')
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# --- plex-bif-orphans -----------------------------------------------------------------
+function New-PMPlexTree {
+    param([int]$Pairs = 1)
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("pm-plex-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path (Join-Path $root 'Localhost\0') -Force | Out-Null
+    function Add-FixtureFile($p) { Set-Content -LiteralPath $p -Value 'x' -Encoding UTF8 }
+    $d = Join-Path $root 'Localhost\0'
+    for ($i = 1; $i -le $Pairs; $i++) {
+        Add-FixtureFile (Join-Path $d "index$i.bif"); Add-FixtureFile (Join-Path $d "index$i.bif.tmp")   # superseded: a candidate
+    }
+    Add-FixtureFile (Join-Path $d 'orphan.bif.tmp')          # no finished partner: may be a generation in flight
+    Add-FixtureFile (Join-Path $d 'weird.bif')
+    Add-FixtureFile (Join-Path $d 'weird.bif.tmpx')          # -Filter '*.tmp' would match this; EndsWith must not
+    # The discriminating trap. Under the correct EndsWith('.tmp') rule 'chunk.tmp.bif' is not a
+    # temp file at all. Under a loose match it IS one, and Substring(len - 4) then strips '.bif'
+    # to give 'chunk.tmp', which EXISTS - so a loose rule would pair them up and delete a
+    # finished .bif. The .tmpx case above cannot show this, because its stripped base has a
+    # trailing dot and never matches anything, so the pairing rule covers for the loose match.
+    Add-FixtureFile (Join-Path $d 'chunk.tmp')
+    Add-FixtureFile (Join-Path $d 'chunk.tmp.bif')
+    Add-FixtureFile (Join-Path $d 'plain.bif')               # not a temp at all
+    return $root
+}
+$plexPick = { param($r) Get-PMPicks -ModuleId 'plex-bif-orphans' -RootResolver 'Get-PlexMediaRoot' -FixtureRoot $r }
+
+It 'plex: selects a .tmp whose finished preview already exists' {
+    $r = New-PMPlexTree
+    try { return ((& $plexPick $r) -contains 'index1.bif.tmp') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'plex: spares a .tmp with no finished partner' {
+    # It may be a preview still being generated. The pairing IS the rule.
+    $r = New-PMPlexTree
+    try { return ((& $plexPick $r) -notcontains 'orphan.bif.tmp') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'plex: spares .tmpx, which the Win32 filter would have matched' {
+    # -Filter '*.tmp' also matches longer extensions, and the blind Substring(len-4) would then
+    # have tested the wrong base path. EndsWith is the rule that was meant.
+    $r = New-PMPlexTree
+    try { return ((& $plexPick $r) -notcontains 'weird.bif.tmpx') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'plex: a loose .tmp match would delete a finished .bif, and does not' {
+    # This is the case that actually discriminates EndsWith from a contains-style match:
+    # 'chunk.tmp.bif' is not a temp file, but a loose rule would treat it as one, strip four
+    # characters to 'chunk.tmp', find that file present, and delete the .bif as an orphan.
+    $r = New-PMPlexTree
+    try { return ((& $plexPick $r) -notcontains 'chunk.tmp.bif') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'plex: selects exactly the superseded temps and nothing else' {
+    $r = New-PMPlexTree -Pairs 2
+    try {
+        $p = @(& $plexPick $r) | Sort-Object
+        return (($p -join ',') -eq 'index1.bif.tmp,index2.bif.tmp')
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# --- stale-app-temp -------------------------------------------------------------------
+function New-PMStaleTree {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("pm-stale-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $old = (Get-Date).AddDays(-60)
+    function Add-FixtureDir($p) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
+    function Add-FixtureFile($p) { Add-FixtureDir (Split-Path $p -Parent); Set-Content -LiteralPath $p -Value 'x' -Encoding UTF8 }
+    Add-FixtureFile (Join-Path $root 'Adobe\a.txt')             # exact name, stale
+    Add-FixtureFile (Join-Path $root 'occt\b.txt')              # exact name in the wrong case: -contains is case-insensitive
+    Add-FixtureFile (Join-Path $root '7zO1234\c.txt')           # prefix match
+    Add-FixtureFile (Join-Path $root 'WinGetSomething\d.txt')   # StartsWith a listed NAME but is not one: must be spared
+    Add-FixtureFile (Join-Path $root 'RandomApp\e.txt')         # not listed at all
+    Add-FixtureFile (Join-Path $root 'CreativeCloud\f.txt')     # exact name, but will be stamped recent
+    foreach ($d in @('Adobe','occt','7zO1234','WinGetSomething','RandomApp')) {
+        (Get-Item -LiteralPath (Join-Path $root $d)).LastWriteTime = $old
+    }
+    (Get-Item -LiteralPath (Join-Path $root 'CreativeCloud')).LastWriteTime = (Get-Date)
+    return $root
+}
+$stalePick = { param($r) Get-PMPicks -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $r }
+
+It 'stale: selects a listed application directory past the floor' {
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -contains 'Adobe') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: the exact-name list is case-insensitive' {
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -contains 'occt') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: selects a prefix match' {
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -contains '7zO1234') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: spares a name that merely STARTS WITH a listed name' {
+    # The discriminating pair: the names list is exact-match, only the prefixes list is StartsWith.
+    # WinGetSomething must survive while 7zO1234 does not.
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -notcontains 'WinGetSomething') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: spares an unlisted directory of the same age' {
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -notcontains 'RandomApp') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: spares a listed directory that is younger than the floor' {
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -notcontains 'CreativeCloud') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: selects exactly three things and nothing else' {
+    $r = New-PMStaleTree
+    try {
+        $p = @(& $stalePick $r) | Sort-Object
+        return (($p -join ',') -eq '7zO1234,Adobe,occt')
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== Count is the truth; Items may be capped ==" -ForegroundColor Cyan
+It 'a module reporting more than the cap returns the TRUE Count with capped Items' {
+    # Replaces a grep for the literal string "Count = @($items).Count", which passed whether or
+    # not the field meant anything. 30 real orphans, Items capped at 25, Count must say 30.
+    $r = New-PMPlexTree -Pairs 30
+    try {
+        $o = Invoke-PMModuleTest -ModuleId 'plex-bif-orphans' -RootResolver 'Get-PlexMediaRoot' -FixtureRoot $r
+        return ($o.Result.Count -eq 30 -and @($o.Result.Items).Count -eq 25)
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a clean module reports Clean with no findings' {
+    $r = New-PMPlexTree -Pairs 0
+    try {
+        # Pairs 0 leaves only the unpaired orphan, the .tmpx and two plain files: nothing to do.
+        $o = Invoke-PMModuleTest -ModuleId 'plex-bif-orphans' -RootResolver 'Get-PlexMediaRoot' -FixtureRoot $r
+        return ($o.Result.Clean -eq $true -and @($o.Result.Items).Count -eq 0)
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'the uncapped module reports Count equal to its Items' {
+    # stale-app-temp is the one module with no Select-Object -First 25, so the two must agree.
+    $r = New-PMStaleTree
+    try {
+        $o = Invoke-PMModuleTest -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $r
+        return ($o.Result.Count -eq 3 -and @($o.Result.Items).Count -eq 3)
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== every module's load-bearing read is Critical ==" -ForegroundColor Cyan
+foreach ($case in @(
+    @{ Id = 'vs-installer-scratch'; R = 'Get-VsScratchRoot' }
+    @{ Id = 'plex-bif-orphans';     R = 'Get-PlexMediaRoot' }
+    @{ Id = 'stale-app-temp';       R = 'Get-StaleTempRoot' }
+    @{ Id = 'agent-scratchpads';    R = 'Get-AgentScratchRoot' })) {
+    $c = $case
+    It "$($c.Id): an unreadable root is a CRITICAL read failure, not an empty result" {
+        # Replaces a grep for the literal string "-Critical", which was satisfied by the flag
+        # appearing anywhere in the file, including inside a comment. A module whose root read is
+        # not Critical reports a clean machine while blind, which is the whole bug.
+        $d = New-PMUnreadableDir
+        if (-not $d) { return 'SKIP' }
+        try {
+            $o = Invoke-PMModuleTest -ModuleId $c.Id -RootResolver $c.R -FixtureRoot $d
+            return ($o.CriticalReads -gt 0)
+        } finally { Remove-PMUnreadableDir $d }
+    }
 }
 
 Write-Host "`n== HTML report ==" -ForegroundColor Cyan
