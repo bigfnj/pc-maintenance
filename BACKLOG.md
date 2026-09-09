@@ -11,12 +11,12 @@ The modules have no behavioural tests at all, so item 1 comes first: every other
 list touches code that nothing currently verifies, and doing them in the other order means fixing
 guards while unable to tell whether a module still works. After that, the path-pattern gaps (2)
 are a single batch in a single file with one test shape, and they are worth closing *before* a new
-module makes them reachable rather than after. Item 3 is the only one that adds a capability
-rather than protecting one. Item 4 needs a design decision and has the lowest reachability, so it
-goes last.
+module makes them reachable rather than after. Item 3 is done. Item 4 needs a design decision and
+has the lowest reachability, so it goes last.
 
-Nothing here is reachable through the four shipped modules today. That is the reason none of it is
-urgent, and also the reason it is easy to leave until a fifth module quietly makes it reachable.
+Nothing still open here is reachable through the four shipped modules today. That is the reason
+none of it is urgent, and also the reason it is easy to leave until a fifth module quietly makes
+it reachable.
 
 ---
 
@@ -25,15 +25,16 @@ urgent, and also the reason it is easy to leave until a fifth module quietly mak
 **Why first:** it is the only category with literally zero coverage, and it gates honest work on
 everything else. `vs-installer-scratch`'s three-condition identification rule decides whether tens
 of gigabytes of somebody's TEMP get deleted, and it is currently checked only by a regex over its
-own source text. The same goes for `plex-bif-orphans`' pairing rule, `stale-app-temp`'s allowlist
-and age floor, and `agent-scratchpads`' deliberate refusal to act.
+own source text. The same goes for `plex-bif-orphans`' pairing rule and `stale-app-temp`'s
+allowlist and age floor. `agent-scratchpads` got real fixture tests when it was enabled, so it is
+the shape to copy for the other three.
 
 **Shape:** a fixture tree per module, run `Test-PMModule` against it, assert exactly which paths
 come back. That also retires the three source-text greps in the suite, which pass whether or not
 the thing they describe still works.
 
-**Watch for:** `agent-scratchpads`' `Repair-PMModule` returns `Ok = $false` on purpose. A test
-must assert that refusal, not treat it as a bug.
+**Watch for:** three of the four now delete, so a fixture test must assert exactly which paths
+come back, not merely that some do.
 
 ## 2. The path guard reads broader than it is
 
@@ -75,10 +76,10 @@ session-GUID directories, and refusing `bundled-skills` outright. Currently iden
 sessions and 3.22 GB. Four rules mutation-tested.
 
 ⚠ The `bundled-skills` guard was **not provable at first**, and the reason is a trap worth
-remembering: the fixture path was written through a Python replacement string where `` was eaten
-as an escape, so the directory the test claimed to create never existed and the test passed no
-matter what. The patch script asserted its *anchor* matched; it did not verify the *replacement*
-landed. Assert both.
+remembering: the fixture path went through a Python replacement string where a backslash-digit
+sequence was eaten as an escape, so the directory the test claimed to create never existed and
+the test passed no matter what. The patch script asserted its *anchor* matched; it did not
+verify the *replacement* landed. Assert both.
 
 ## 4. TOCTOU inside `Remove-PMPath`
 
