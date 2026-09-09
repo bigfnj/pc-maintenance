@@ -23,13 +23,17 @@ preference is an inconvenience you notice, a wrongly deleted file is gone.
 Get-Content .\logs\latest.json
 ```
 
-**Deletion needs three independent things to agree.** Any one of them alone blocks it:
+**Deletion needs four independent things to agree.** Any one of them alone blocks it:
 
 1. the operator passed `-Apply`;
 2. the module's own `module.psd1` sets `AutoApply = $true` (absent reads as false, so a module
    that forgets to declare it is report-only rather than trusted);
-3. the target survives the hard-coded path guard in `lib/PMCommon.ps1`, which no manifest can
-   configure.
+3. the interactive user was confirmed logged on, not merely inferred from the registry;
+4. the target survives the path guard: under the module's *declared* roots, and matching no
+   hard-coded forbidden pattern.
+
+`pcmaintenance.manifest.json` is not one of them. Nothing a module or a manifest says can widen
+what may be deleted.
 
 ## Install
 
@@ -64,16 +68,26 @@ mtime is not a liveness signal, so deleting a session that is merely idle betwee
 break a running agent. That one needs a real liveness check, not a longer timeout, and its
 `Repair` refuses even if called.
 
-## Two things that keep the output honest
+## Three things that keep the output honest
 
 **The path guard.** The framework this borrows from is kept safe by a hard-coded forbidden
 *category* set that wins even when a module mislabels itself. The equivalent here is a hard-coded
 forbidden *path* set, because what this tool can get wrong is measured in deleted bytes.
-`Test-PMPathSafe` requires two independent conditions: the target sits under a root the module
-declared, **and** it matches no forbidden pattern and is at least three segments deep. Neither
-alone is sufficient, and a module cannot vote itself an exemption from either. Docker volume
-roots are refused by name, because from the outside one looks exactly like disposable scratch
-while holding an application's only copy of its data.
+
+Two conditions, and the second one is the point: the target must sit under a root **declared in
+the module's own `module.psd1`**, which the dispatcher expands and hands to `Remove-PMPath` so the
+module cannot influence it, **and** it must match no forbidden pattern at three or more segments
+deep. A module supplying its own root would be self-certification, which is what this was until an
+audit noticed the declared roots were never actually read. It fails closed: no resolvable declared
+roots means no deletion at all. Docker volume roots are refused by name, because from the outside
+one looks exactly like disposable scratch while holding an application's only copy of its data.
+
+**The payload must not be writable by a non-admin.** The dispatcher dot-sources every `.ps1` under
+`lib/` and the task runs as SYSTEM, so a payload directory a standard user can write to is
+arbitrary code execution as SYSTEM. `C:\ProgramData` inherits exactly that permission by default.
+The installer hardens the ACL and verifies it took, and the dispatcher independently refuses to
+run privileged from a writable payload, because an install that skipped the hardening must not
+silently re-open the hole.
 
 **Blind is not clean.** A module that could not *read* is never reported as clean. The readers
 record what they failed to open instead of quietly returning less, and a failure on a module's own
@@ -101,7 +115,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
 
 Non-destructive, no Pester dependency. Run it under **Windows PowerShell 5.1**, not only 7,
 because 5.1 is what the scheduled task runs; the suite parses every script under 5.1 for that
-reason. 64 tests.
+reason, and says so loudly if you run it under 7.
+
+96 tests elevated, 95 plus one honest SKIP otherwise. A skip is counted and printed separately
+rather than folded into the pass total: a check that reports success while verifying nothing is
+the exact failure this project exists to catch, so the suite must not commit it either.
 
 ## Layout
 
@@ -110,7 +128,8 @@ Invoke-PcMaintenance.ps1       dispatcher (report-only unless -Apply)
 Install-/Uninstall-*.ps1       ProgramData payload + SYSTEM task register/remove
 task_template.xml              weekly SYSTEM task, no policy triggers
 pcmaintenance.manifest.json    modules, order, allowedCategories, task shape, retention
-lib/PMCommon.ps1               logging, user resolution, filesystem readers, THE PATH GUARD
+lib/PMCommon.ps1               logging, user resolution, filesystem readers, THE PATH GUARD,
+                               and the payload-ACL check the installer must satisfy
 lib/PMManifest.ps1             manifest load + the category and apply gates
 lib/PMModule.ps1               module metadata import + isolated phase invocation
 lib/PMReport.ps1               Downloads resolution + the HTML dashboard
