@@ -6,7 +6,7 @@
 .DESCRIPTION
     The task goes by default; the payload stays unless you ask, because the payload carries the
     run history and the reports are the only record of what was deleted and when. There is no
-    -RestoreBackups here (preference-guard has one) for the reason the whole design turns on:
+    -RestoreBackups here (the project this borrows from has one) for the reason the whole design turns on:
     nothing backs up a deletion. The run JSON is the record.
 
 .EXAMPLE

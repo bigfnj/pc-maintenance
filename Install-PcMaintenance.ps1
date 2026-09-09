@@ -57,7 +57,7 @@ Write-PMLog "=== installing pc-maintenance to $PayloadRoot ===" 'INFO'
 # --- 1. payload -----------------------------------------------------------------------
 # Each target is REMOVED before copying: Copy-Item -Recurse nests into an existing directory
 # instead of overwriting it, so a redeploy would otherwise build lib\lib\PMCommon.ps1. Same trap
-# preference-guard hit and fixed.
+# the project this borrows from hit and fixed.
 $items = @('Invoke-PcMaintenance.ps1', 'pcmaintenance.manifest.json', 'lib', 'modules')
 New-Item -ItemType Directory -Path $PayloadRoot -Force | Out-Null
 foreach ($i in $items) {

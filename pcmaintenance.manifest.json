@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "_comment": "pc-maintenance: ongoing Windows housekeeping as pluggable modules. Report-only unless the dispatcher gets -Apply AND the module declares AutoApply. Borrowed from preference-guard's framework; the task cadence here is WEEKLY, with no Group Policy triggers, because nothing this tool watches is caused by a policy refresh.",
+  "_comment": "pc-maintenance: ongoing Windows housekeeping as pluggable modules. Report-only unless the dispatcher gets -Apply AND the module declares AutoApply. Framework borrowed from a sibling project; the task cadence here is WEEKLY, with no Group Policy triggers, because nothing this tool watches is caused by a policy refresh.",
   "task": {
     "name": "PcMaintenance",
     "weeklyDay": "Sunday",

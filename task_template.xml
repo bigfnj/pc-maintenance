@@ -5,7 +5,7 @@
     <URI>\PcMaintenance</URI>
   </RegistrationInfo>
   <Triggers>
-    <!-- Weekly, not the 90-minute interval preference-guard uses. Nothing this tool watches is
+    <!-- Weekly, not the 90-minute interval the project this borrows from uses. Nothing this tool watches is
          caused by a policy refresh, and a sweep of thousands of directories has no business
          running every 90 minutes. StartWhenAvailable covers a machine that was off at 03:00. -->
     <CalendarTrigger>
@@ -20,7 +20,7 @@
   <Principals>
     <!-- Canonical SYSTEM form. RunLevel HighestAvailable and NO LogonType element: Task Scheduler
          rejects an explicit ServiceAccount LogonType here with "value incorrectly formatted or out
-         of range" (documented in preference-guard, same trap). -->
+         of range" - the same trap the sibling project documented. -->
     <Principal id="Author">
       <UserId>S-1-5-18</UserId>
       <RunLevel>HighestAvailable</RunLevel>

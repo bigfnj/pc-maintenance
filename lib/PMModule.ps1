@@ -2,7 +2,7 @@
 <#
     PMModule.ps1 - module metadata import + isolated phase invocation.
 
-    Unchanged in shape from preference-guard's PGModule: every module defines functions named
+    Unchanged in shape from the framework this borrows: every module defines functions named
     Test-PMModule / Repair-PMModule, so each phase runs inside a `& {}` child scope that
     dot-sources the shared lib and the one module and is then discarded. Same-named functions
     can never collide across modules, and a module that throws is contained to its own phase.
@@ -18,7 +18,7 @@ function Import-PMModuleInfo {
             throw "module.psd1 missing required key '$k' in $ModuleDir"
         }
     }
-    # Roots is required here where preference-guard has no equivalent: it is half of the path
+    # Roots is required here where the original has no equivalent: it is half of the path
     # guard, and a module with no declared roots can delete nothing, so an omission must be
     # loud at load rather than a silent no-op at run time.
     if (-not $info.ContainsKey('Roots')) { throw "module.psd1 missing required key 'Roots' in $ModuleDir" }

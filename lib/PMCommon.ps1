@@ -3,8 +3,8 @@
     PMCommon.ps1 - pc-maintenance shared helpers.
 
     Dot-source only; no side effects on load, so it is safe to re-dot-source inside each
-    module's isolated child scope. Borrowed in shape from preference-guard's PGCommon, with
-    one deliberate difference: this framework DELETES, so the readers modules are required to
+    module's isolated child scope. Borrowed in shape from the framework this project is based on,
+    with one deliberate difference: this framework DELETES, so the readers modules are required to
     go through are filesystem readers, and every removal passes a hard path guard first.
 #>
 
@@ -73,14 +73,15 @@ function Get-PMInteractiveUserSid {
 
 # --- the path guard -------------------------------------------------------------------
 #
-# preference-guard's safety keystone is a hard-coded FORBIDDEN CATEGORY set that wins even if a
-# module mislabels itself. The equivalent here is a hard-coded FORBIDDEN PATH set, because the
+# The framework this borrows from is kept safe by a hard-coded FORBIDDEN CATEGORY set that wins
+# even if a module mislabels itself. The equivalent here is a hard-coded FORBIDDEN PATH set, because the
 # damage this framework can do is measured in deleted bytes, not in policy. Both gates are
 # deliberately not configurable from the manifest: a module cannot vote itself the right to
 # delete somewhere dangerous.
 #
-# Docker is named because 22 volumes on this box hold finance records and student IEP data, and
-# a Docker volume root looks exactly like disposable scratch from the outside.
+# Docker is named explicitly because a volume root looks exactly like disposable scratch from
+# the outside while holding an application's only copy of its data. Guessing wrong there is not
+# recoverable, so it is refused by name rather than left to a heuristic.
 
 $script:PMForbiddenPathPatterns = @(
     '^[A-Za-z]:\\?$'                                # a drive root

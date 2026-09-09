@@ -9,8 +9,7 @@
 function Get-PlexMediaRoot {
     <#
         Resolves the junction. Plex's Media directory is very commonly moved to another volume
-        and left behind as a junction, which is what happened on the box this was written for
-        (Media -> E:\PlexMedia).
+        and left behind as a junction, which is what happened on the box this was written for.
 
         That matters because this runs as SYSTEM, and Windows will NOT let a privileged process
         traverse a cross-volume junction created by a less-privileged user: the read fails with

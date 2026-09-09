@@ -2,10 +2,11 @@
 <#
     PMManifest.ps1 - manifest load/validation and the two governance gates.
 
-    Category governance is inherited from preference-guard unchanged in shape: a per-manifest
-    allowlist PLUS a hard-coded forbidden set that wins even when a module mislabels itself.
+    Category governance is inherited unchanged in shape from the framework this borrows from: a
+    per-manifest allowlist PLUS a hard-coded forbidden set that wins even when a module mislabels
+    itself.
 
-    This framework adds a SECOND gate that preference-guard does not need, because this one
+    This framework adds a SECOND gate the original does not need, because this one
     deletes: a module may only remove things when the operator passed -Apply AND the module's
     own manifest sets AutoApply = $true. Either gate alone leaves it report-only. That is what
     lets a class stay observational for months while a proven-mechanical one is allowed to act,
