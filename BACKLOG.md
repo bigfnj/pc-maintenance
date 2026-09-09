@@ -83,15 +83,43 @@ verify the *replacement* landed. Assert both.
 
 ## 4. TOCTOU inside `Remove-PMPath`
 
-Between `Test-PMPathSafe`, the `Test-Path`, and the `Remove-Item` there is a window in which an
-intermediate directory can be swapped for a junction, and the swept trees live under
-`%LOCALAPPDATA%\Temp`, which the interactive user owns. A deliberate local attacker could have
-SYSTEM delete an arbitrary file.
+Measured 2026-09-09 rather than assumed, because the original entry overstated it. Three cases,
+all run on this build:
 
-**Why last:** it needs interactive access already, no shipped module can produce such a path, and
-the fix is a real design decision rather than a patch — most likely opening a handle with
-`FILE_FLAG_OPEN_REPARSE_POINT` and operating on that, which changes the removal path for every
-module. Worth doing deliberately, not squeezed in.
+| case | what was tried | victim |
+|---|---|---|
+| A | junction nested inside a tree we `Remove-Item -Recurse` | **survived** |
+| B | the swept path itself swapped for a junction after the guard ran | **survived** |
+| C | deleting a path that TRAVERSES a junction to a real file | **destroyed** |
+
+So `Remove-Item -Recurse` deletes the reparse point, not the target, which kills the textbook
+attack. **Only case C works**, and reaching it needs a module to hand `Remove-PMPath` a path that
+goes *through* a link. `Get-ChildItem -Recurse` does not descend junctions (measured: 0 files
+found under a directory containing one), so no module can enumerate such a path.
+
+That leaves one real route: a module that deletes individual FILES, where an attacker swaps an
+intermediate directory for a junction between Test and Repair. Of the four, only
+`plex-bif-orphans` deletes files rather than directories. The attack needs write access to the
+Plex media cache, timing inside the Test-to-Repair window, and a victim file whose leaf name
+matches the `.tmp` being removed.
+
+**What it is worth depends entirely on the threat model.** On a single-user workstation where the
+interactive user is an administrator, anyone who can create a junction in that tree can already
+run code as themselves, and SYSTEM is not a boundary they need to cross. It matters only if the
+interactive user is a standard user and SYSTEM is a privilege boundary worth defending.
+
+**Options, cheapest first:**
+
+1. **Re-check the ancestors immediately before deleting.** Walk from the target up to the declared
+   root asserting nothing is a reparse point, right before `Remove-Item`. Narrows the window to
+   microseconds, stays in plain PowerShell, maybe 20 lines. Does not close it.
+2. **Delete files by handle.** Open with `FILE_FLAG_OPEN_REPARSE_POINT`, verify, then delete
+   through that handle. Closes it properly for the file case, needs P/Invoke.
+3. **Accept it and write down why.** Defensible on a single-admin box, and the honest option if
+   the threat model does not include a hostile local user.
+
+I would take (1) unless the threat model says otherwise: most of the benefit, none of the
+complexity, and it keeps the tool auditable, which is a real part of its value.
 
 ---
 
@@ -111,10 +139,10 @@ module. Worth doing deliberately, not squeezed in.
 
 ## Decisions worth revisiting later, not bugs
 
-- **Should a weekly job speak when it finds nothing?** It currently writes a report every run. A
-  job that always speaks becomes background noise, and one that only speaks on a threshold can be
-  quietly broken for months. No obvious right answer; revisit once there is a few months of real
-  run history to look at.
+- ~~**Should a weekly job speak when it finds nothing?**~~ **Closed 2026-09-09.** Moot in practice:
+  `plex-bif-orphans` regenerates on every preview Plex builds, at a measured 100% recurrence, so a
+  weekly report will essentially never be empty. The "always speaks becomes noise" failure needs a
+  job that usually finds nothing, and this one does not.
 - **Promoting entries out of `stale-app-temp`.** The right move is to graduate one application at
   a time into its own module once its behaviour has been watched long enough to state a mechanical
   rule for it. Flipping the whole allowlist to `AutoApply` would be trusting every entry at once,
