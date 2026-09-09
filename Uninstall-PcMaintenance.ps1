@@ -43,6 +43,13 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 if ($RemoveFiles) {
+    # -PayloadRoot is operator input and this is a recursive force delete, so it goes through the
+    # same guard every module does. Without it, -PayloadRoot C:\ deleted the drive root.
+    $guardRoot = Split-Path -Parent $PayloadRoot
+    if (-not (Test-PMPathSafe -Path $PayloadRoot -Roots @($guardRoot) -MinDepth 2)) {
+        Write-PMLog "refusing to delete '$PayloadRoot' - the path guard rejects it" 'ERROR'
+        exit 1
+    }
     if ($KeepLogs -and (Test-Path -LiteralPath (Join-Path $PayloadRoot 'logs'))) {
         foreach ($i in @('Invoke-PcMaintenance.ps1', 'pcmaintenance.manifest.json', 'lib', 'modules')) {
             $p = Join-Path $PayloadRoot $i

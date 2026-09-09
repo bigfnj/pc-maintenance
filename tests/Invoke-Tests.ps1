@@ -14,21 +14,56 @@ param()
 
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
+$script:RepoRoot = $root
 $libDir = Join-Path $root 'lib'
 foreach ($f in 'PMCommon.ps1', 'PMManifest.ps1', 'PMModule.ps1', 'PMReport.ps1') { . (Join-Path $libDir $f) }
 
-$script:Pass = 0; $script:Fail = 0
+function New-PMFixtureRoot {
+    <#
+        A dispatcher fixture has to look like a real install, because the dispatcher refuses to
+        run PRIVILEGED out of a directory a non-admin can write to. Under elevation these tests
+        are themselves privileged, so an un-hardened fixture in the user's TEMP is correctly
+        rejected and the suite would behave differently elevated than not. Hardening the fixture
+        makes the two agree, and exercises Set-PMPayloadAcl on the way past.
+    #>
+    param([string]$Prefix)
+    $fx = Join-Path ([IO.Path]::GetTempPath()) ($Prefix + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $fx -Force | Out-Null
+    if (Test-PMElevated) { Set-PMPayloadAcl -Path $fx }
+    return $fx
+}
+$script:Pass = 0; $script:Fail = 0; $script:Skip = 0
 function It {
+    <#
+        A body returns $true, $false, or the string 'SKIP' when a precondition this machine cannot
+        meet makes the check verify nothing. A skip is COUNTED AND PRINTED, never folded into the
+        pass total: a check that quietly reports success while doing nothing is the exact failure
+        this suite exists to catch, and the suite must not commit it itself.
+
+        `if ($r)` is deliberately not used for the truthy test - a body that leaks a value plus
+        $false forms a 2-element array, which PowerShell treats as true.
+    #>
     param([string]$Name, [scriptblock]$Body)
     try {
-        $r = & $Body
-        if ($r) { $script:Pass++; Write-Host "  ok   $Name" -ForegroundColor Green }
-        else { $script:Fail++; Write-Host "  FAIL $Name" -ForegroundColor Red }
+        $r = @(& $Body)
+        $v = if ($r.Count) { $r[-1] } else { $null }
+        if ($v -is [string] -and $v -eq 'SKIP') {
+            $script:Skip++; Write-Host "  SKIP $Name" -ForegroundColor Yellow
+        } elseif ($v -eq $true) {
+            $script:Pass++; Write-Host "  ok   $Name" -ForegroundColor Green
+        } else {
+            $script:Fail++; Write-Host "  FAIL $Name" -ForegroundColor Red
+        }
     } catch {
         $script:Fail++; Write-Host "  FAIL $Name -- $($_.Exception.Message)" -ForegroundColor Red
     }
 }
 
+if ($PSVersionTable.PSVersion.Major -ne 5) {
+    Write-Host "`n*** RUNNING UNDER PowerShell $($PSVersionTable.PSVersion). The scheduled task runs" -ForegroundColor Yellow
+    Write-Host "*** Windows PowerShell 5.1, where ?? / ?. / ternary are PARSE ERRORS. The parse" -ForegroundColor Yellow
+    Write-Host "*** checks below prove nothing about 5.1 from here. Re-run with powershell.exe." -ForegroundColor Yellow
+}
 Write-Host "`n== parses under $($PSVersionTable.PSVersion) ==" -ForegroundColor Cyan
 foreach ($f in (Get-ChildItem $root -Recurse -Filter *.ps1 -File)) {
     It "parses: $($f.Name)" {
@@ -86,6 +121,11 @@ It 'forbidden set beats a mislabelled allowlist' { -not (Test-PMCategoryAllowed 
 
 Write-Host "`n== shipped modules ==" -ForegroundColor Cyan
 $modDirs = Get-ChildItem (Join-Path $root 'modules') -Directory
+It 'there are modules to check at all' {
+    # Six tests below are `foreach (...) { ... }; return $true`, which pass on zero iterations.
+    # Without this, deleting the modules directory left the whole suite green.
+    return (@($modDirs).Count -ge 4)
+}
 It 'every module loads and declares the required keys' {
     foreach ($d in $modDirs) { $null = Import-PMModuleInfo -ModuleDir $d.FullName }
     return $true
@@ -129,15 +169,15 @@ New-Item -ItemType Directory -Path $victim -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $victim 'f.txt') -Value 'x' -Encoding UTF8
 try {
     It 'report-only computes size and removes nothing' {
-        $r = Remove-PMPath -Path $victim -Roots @($sandbox) -WhatIfOnly
+        $r = Remove-PMPath -Path $victim -Roots @($sandbox) -DeclaredRoots @($sandbox) -WhatIfOnly
         return ((-not $r.Removed) -and $r.Reason -eq 'report-only' -and (Test-Path $victim))
     }
     It 'refuses an unsafe path without touching it' {
-        $r = Remove-PMPath -Path 'C:\Windows\System32' -Roots @('C:\Windows')
+        $r = Remove-PMPath -Path 'C:\Windows\System32' -Roots @('C:\Windows') -DeclaredRoots @('C:\Windows')
         return ((-not $r.Removed) -and $r.Skipped -and $r.Reason -eq 'refused by path guard' -and (Test-Path 'C:\Windows\System32'))
     }
     It 'removes a safe target when asked for real' {
-        $r = Remove-PMPath -Path $victim -Roots @($sandbox)
+        $r = Remove-PMPath -Path $victim -Roots @($sandbox) -DeclaredRoots @($sandbox)
         return ($r.Removed -and -not (Test-Path $victim))
     }
 } finally {
@@ -173,7 +213,7 @@ It 'the dispatcher checks unverified BEFORE it checks clean' {
     # unverified block EXISTS would still pass with the branches swapped.
     $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
     $iUnver = $src.IndexOf('$tw.CriticalReadErrors -gt 0')
-    $iClean = $src.IndexOf('if ($t.Clean)')
+    $iClean = $src.IndexOf("`n            if (`$t.Clean) {")
     return ($iUnver -gt 0 -and $iClean -gt 0 -and $iUnver -lt $iClean)
 }
 It 'an unverified module makes the run exit non-zero' {
@@ -190,12 +230,14 @@ It 'Resolve-PMReparsePoint follows a junction to its target' {
     New-Item -ItemType Directory -Path $real -Force | Out-Null
     try {
         $null = cmd /c mklink /J "`"$link`"" "`"$real`"" 2>&1
-        if (-not (Test-Path -LiteralPath $link)) { return $true }   # no junction support: not a failure
+        if (-not (Test-Path -LiteralPath $link)) {
+            return 'SKIP'   # junctions unavailable here   # a skip that reports success is how a guard rots unnoticed
+        }
         return ((Resolve-PMReparsePoint -Path $link) -eq $real)
     } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'end to end: a module that cannot read is reported unverified, not clean' {
-    $fx = Join-Path ([IO.Path]::GetTempPath()) ("pm-fx-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $fx = New-PMFixtureRoot -Prefix "pm-fx-"
     $md = Join-Path $fx 'modules\blindmod'
     New-Item -ItemType Directory -Path $md -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $root 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
@@ -220,6 +262,296 @@ function Repair-PMModule { param($Context) [pscustomobject]@{ Changed=$false; Ok
         $j = Get-Content -LiteralPath (Join-Path $fx 'logs\latest.json') -Raw | ConvertFrom-Json
         return ($j.modules[0].status -eq 'unverified' -and $j.summary.unverified -eq 1 -and $j.exitCode -eq 1)
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== the deletion gates, wired end to end ==" -ForegroundColor Cyan
+function New-PMGateFixture {
+    <#
+        A dispatcher fixture whose Repair drops a marker file. Testing the gates through the REAL
+        dispatcher is the point: Test-PMApplyAllowed's truth table was already covered, but nothing
+        asserted the dispatcher HONOURED it, so hardcoding $mayApply = $true left the suite green
+        while a report-only run deleted.
+    #>
+    param([bool]$AutoApply)
+    $fx = New-PMFixtureRoot -Prefix "pm-gate-"
+    $md = Join-Path $fx 'modules\gatemod'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    $auto = if ($AutoApply) { 'true' } else { 'false' }
+    $psd1 = @(
+        '@{'
+        "    Id = 'gatemod'; Name = 'Gate'; Category = 'maintenance'; Version = '1.0.0'"
+        '    RequiresUserSid = $false'
+        "    AutoApply = `$$auto"
+        "    Roots = @('$fx')"
+        "    Entry = 'module.ps1'; Description = 'fixture'"
+        '}'
+    )
+    $psd1 | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    $marker = Join-Path $fx 'REPAIR-RAN.txt'
+    $body = @(
+        'function Test-PMModule {'
+        '    param($Context)'
+        "    [pscustomobject]@{ Clean = `$false; Count = 1; Detail = 'one thing'; Bytes = [int64]1; Items = @() }"
+        '}'
+        'function Repair-PMModule {'
+        '    param($Context)'
+        "    Set-Content -LiteralPath '$marker' -Value 'yes' -Encoding UTF8"
+        "    [pscustomobject]@{ Ok = `$true; Bytes = [int64]0; Detail = 'fixture' }"
+        '}'
+    )
+    $body | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"gatemod","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    return $fx
+}
+function Invoke-PMGateFixture {
+    param([string]$Fixture, [bool]$Apply)
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Fixture 'Invoke-PcMaintenance.ps1'), '-NoReport')
+    if ($Apply) { $a += '-Apply' }
+    $null = & powershell.exe @a 2>&1
+    return (Test-Path -LiteralPath (Join-Path $Fixture 'REPAIR-RAN.txt'))
+}
+foreach ($cell in @(
+    @{ Auto = $true;  Apply = $true;  Expect = $true;  Name = 'AutoApply + -Apply    -> Repair RUNS' }
+    @{ Auto = $true;  Apply = $false; Expect = $false; Name = 'AutoApply, no -Apply  -> Repair does not run' }
+    @{ Auto = $false; Apply = $true;  Expect = $false; Name = 'no AutoApply, -Apply  -> Repair does not run' }
+    @{ Auto = $false; Apply = $false; Expect = $false; Name = 'neither               -> Repair does not run' })) {
+    $c = $cell
+    It $c.Name {
+        $fx = New-PMGateFixture -AutoApply $c.Auto
+        try { return ((Invoke-PMGateFixture -Fixture $fx -Apply $c.Apply) -eq $c.Expect) }
+        finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+It 'the PROCESS exit code reports failure, not just the JSON field' {
+    # Task Scheduler only ever sees the process exit code. Asserting the JSON field alone meant
+    # `exit $exitCode` could be changed to `exit 0` with the suite still green.
+    $fx = New-PMFixtureRoot -Prefix "pm-exit-"
+    $md = Join-Path $fx 'modules\blind2'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    @(
+        '@{'
+        "    Id = 'blind2'; Name = 'B'; Category = 'maintenance'; Version = '1.0.0'"
+        '    RequiresUserSid = $false'
+        '    AutoApply = $false'
+        "    Roots = @('C:\nowhere')"
+        "    Entry = 'module.ps1'; Description = 'fixture'"
+        '}'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    @(
+        'function Test-PMModule {'
+        '    param($Context)'
+        "    try { Get-ChildItem -LiteralPath 'C:\__nope__\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors `$_ -Critical }"
+        "    [pscustomobject]@{ Clean = `$true; Detail = 'looks clean'; Bytes = [int64]0; Items = @() }"
+        '}'
+        'function Repair-PMModule { param($Context) [pscustomobject]@{ Ok = $true; Bytes = [int64]0; Detail = @() } }'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"blind2","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fx 'Invoke-PcMaintenance.ps1') -NoReport 2>&1
+        return ($LASTEXITCODE -eq 1)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== declared Roots are enforced, not self-certified ==" -ForegroundColor Cyan
+It 'Remove-PMPath fails CLOSED when no declared roots are supplied' {
+    # Treating an empty list as "no restriction" would delete the independent half of the guard
+    # exactly when a caller forgot to pass it.
+    $r = Remove-PMPath -Path 'C:\Users\Someone\AppData\Local\Temp\x' -Roots @('C:\Users\Someone\AppData\Local\Temp')
+    return ((-not $r.Removed) -and $r.Skipped -and ($r.Reason -match 'no declared roots'))
+}
+It 'Remove-PMPath refuses a target outside the module-declared roots' {
+    # The module supplies -Roots itself, so on its own that is self-certification. -DeclaredRoots
+    # comes from module.psd1 via the dispatcher, and the module cannot influence it.
+    $sandbox = Join-Path ([IO.Path]::GetTempPath()) ("pm-dr-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $inside = Join-Path $sandbox 'declared\thing'
+    $outside = Join-Path $sandbox 'elsewhere\thing'
+    New-Item -ItemType Directory -Path $inside -Force | Out-Null
+    New-Item -ItemType Directory -Path $outside -Force | Out-Null
+    try {
+        $declared = @(Join-Path $sandbox 'declared')
+        $r = Remove-PMPath -Path $outside -Roots @($sandbox) -DeclaredRoots $declared
+        $blocked = ((-not $r.Removed) -and ($r.Reason -match 'declares') -and (Test-Path $outside))
+        $r2 = Remove-PMPath -Path $inside -Roots @($sandbox) -DeclaredRoots $declared
+        return ($blocked -and $r2.Removed)
+    } finally { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'every shipped module declares Roots that actually resolve' {
+    # plex-bif-orphans shipped a literal placeholder here and nothing noticed, because nothing
+    # read the value. It is enforced now, so an unresolvable root disables removal entirely.
+    foreach ($d in $modDirs) {
+        $info = Import-PMModuleInfo -ModuleDir $d.FullName
+        $rs = Get-PMDeclaredRoots -ModuleInfo $info -UserProfile $env:USERPROFILE
+        if (-not @($rs).Count) { return $false }
+        foreach ($r in $rs) { if ($r -match '[<>]') { return $false } }
+    }
+    return $true
+}
+It 'a root with an unresolvable token yields nothing rather than a guess' {
+    return (-not (Expand-PMRoot -Root '%NO_SUCH_VAR_XYZ%\sub' -UserProfile $env:USERPROFILE))
+}
+It 'Expand-PMRoot expands against the INTERACTIVE user, not the process' {
+    # Under SYSTEM the process LOCALAPPDATA points at the systemprofile, so expanding with
+    # ExpandEnvironmentVariables alone would silently miss every declared root.
+    $e = Expand-PMRoot -Root '%LOCALAPPDATA%\Temp' -UserProfile 'C:\Users\Someone'
+    return ($e -eq 'C:\Users\Someone\AppData\Local\Temp')
+}
+
+Write-Host "`n== each forbidden pattern is pinned ==" -ForegroundColor Cyan
+foreach ($case in @(
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\wsl\ext4';          N = 'wsl' }
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\x\site-packages\y'; N = 'site-packages' }
+    @{ P = 'C:\Users\Someone\Desktop\thing';                        N = 'Desktop' }
+    @{ P = 'C:\Users\Someone\Pictures\thing';                       N = 'Pictures' }
+    @{ P = 'C:\Users\Someone\Videos\thing';                         N = 'Videos' }
+    @{ P = 'C:\Users\Someone\Music\thing';                          N = 'Music' }
+    @{ P = 'C:\Users\Someone\Downloads\thing';                      N = 'Downloads (where this tool writes its reports)' }
+    @{ P = 'C:\Program Files (x86)\App\sub';                        N = 'Program Files (x86)' })) {
+    $k = $case
+    It "refuses $($k.N)" { -not (Test-PMPathSafe -Path $k.P -Roots @('C:\Users\Someone', 'C:\Program Files (x86)')) }
+}
+It 'refuses a sibling whose name merely starts with the root name' {
+    # The prefix check and the root-itself check used to cover for each other, so breaking either
+    # one alone left the suite green while C:\...\TempEvil became deletable.
+    -not (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\TempEvil\x' -Roots @('C:\Users\Someone\AppData\Local\Temp'))
+}
+
+Write-Host "`n== Get-PMPathSize ==" -ForegroundColor Cyan
+It 'a missing path is an answer, not an error' {
+    Clear-PMReadErrors
+    $n = Get-PMPathSize -Path 'C:\__nope__\__nope__'
+    return ((Get-PMReadErrorCount) -eq 0 -and $n -eq 0)
+}
+It 'agrees with a known tree' {
+    $sb = Join-Path ([IO.Path]::GetTempPath()) ("pm-sz-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path (Join-Path $sb 'a\b') -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $sb 'a\one.txt') -Value ('x' * 100) -Encoding Ascii -NoNewline
+        Set-Content -LiteralPath (Join-Path $sb 'a\b\two.txt') -Value ('y' * 50) -Encoding Ascii -NoNewline
+        return ((Get-PMPathSize -Path $sb) -eq 150)
+    } finally { Remove-Item -LiteralPath $sb -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== acting only for a confirmed user ==" -ForegroundColor Cyan
+It 'a module needing a user will not act when that user was only inferred' {
+    -not (Test-PMActingUserConfirmed -RequiresUserSid $true -LoggedIn $false)
+}
+It 'a module needing a user acts when the user is confirmed logged on' {
+    Test-PMActingUserConfirmed -RequiresUserSid $true -LoggedIn $true
+}
+It 'a module needing no user is unaffected either way' {
+    (Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $false) -and
+    (Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $true)
+}
+
+Write-Host "`n== the payload must not be writable by a non-admin ==" -ForegroundColor Cyan
+It 'a user-writable directory is reported as insecure' {
+    # The dispatcher dot-sources every .ps1 under lib\, so a directory a standard user can write
+    # to is code execution as whoever runs the task. A directory under the user's own TEMP is
+    # writable by that user by construction, which makes it the natural fixture.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-acl-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try { return (@(Test-PMPayloadSecure -Path $d).Count -gt 0) }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a hardened directory passes the same check' {
+    # Proves Set-PMPayloadAcl actually satisfies Test-PMPayloadSecure. If these two ever drift,
+    # the installer would "succeed" and the dispatcher would refuse to run forever after.
+    if (-not (Test-PMElevated)) {
+        return 'SKIP'   # needs elevation to set an ACL
+    }
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-acl2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        Set-PMPayloadAcl -Path $d
+        return (@(Test-PMPayloadSecure -Path $d).Count -eq 0)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'the deployed payload is not writable by a non-admin' {
+    # The live install, not a fixture. Skips cleanly when nothing is deployed.
+    $deployed = 'C:\ProgramData\PcMaintenance'
+    if (-not (Test-Path -LiteralPath $deployed)) { return $true }
+    return (@(Test-PMPayloadSecure -Path $deployed).Count -eq 0)
+}
+
+Write-Host "`n== a module result that is not one object ==" -ForegroundColor Cyan
+It 'the dispatcher refuses a null Test result instead of deleting' {
+    # $null made `if ($t.Clean)` falsy, so control fell through to the DELETING phase. Absence of
+    # an answer must be the strongest refusal available, not consent.
+    $src = Get-Content -LiteralPath (Join-Path $script:RepoRoot 'Invoke-PcMaintenance.ps1') -Raw
+    $iShape = $src.IndexOf('$null -eq $t -or $t -is [array]')
+    $iFound = $src.IndexOf('$summary.found++')
+    return ($iShape -gt 0 -and $iFound -gt 0 -and $iShape -lt $iFound)
+}
+It 'a module leaking extra output does not silently rewrite its Count' {
+    # An Object[] result makes $t.Count resolve to the ARRAY length rather than the module's
+    # field, so a module reporting 940 was recorded as 2.
+    $fx = New-PMFixtureRoot -Prefix "pm-shape-"
+    $md = Join-Path $fx 'modules\noisy'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    @(
+        '@{'
+        "    Id = 'noisy'; Name = 'N'; Category = 'maintenance'; Version = '1.0.0'"
+        '    RequiresUserSid = $false'
+        '    AutoApply = $false'
+        "    Roots = @('C:\nowhere')"
+        "    Entry = 'module.ps1'; Description = 'fixture'"
+        '}'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    @(
+        'function Test-PMModule {'
+        '    param($Context)'
+        "    'stray output that should not be here'"
+        "    [pscustomobject]@{ Clean = `$false; Count = 940; Detail = 'many'; Bytes = [int64]1; Items = @() }"
+        '}'
+        'function Repair-PMModule { param($Context) [pscustomobject]@{ Ok = $true; Bytes = [int64]0; Detail = "" } }'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"noisy","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fx 'Invoke-PcMaintenance.ps1') -NoReport 2>&1
+        $j = Get-Content -LiteralPath (Join-Path $fx 'logs\latest.json') -Raw | ConvertFrom-Json
+        # Either it refuses the shape outright, or it reports the module's real number. What it
+        # must never do is quietly record the array length as the finding count.
+        return ($j.modules[0].status -eq 'error' -or $j.modules[0].count -eq 940)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== size measures what deletion will actually free ==" -ForegroundColor Cyan
+It 'Get-PMPathSize does not follow a junction' {
+    # DirectoryInfo.EnumerateFiles(AllDirectories) DOES traverse reparse points while
+    # Get-ChildItem -Recurse and Remove-Item -Recurse do not, so counting through one inflates
+    # both the report headline and the "removed N GB" line by a tree nobody deletes.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-jz-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'
+    $host_ = Join-Path $base 'host'
+    New-Item -ItemType Directory -Path $real -Force | Out-Null
+    New-Item -ItemType Directory -Path $host_ -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $real 'big.bin') -Value ('z' * 20000) -Encoding Ascii -NoNewline
+        $null = cmd /c mklink /J "$(Join-Path $host_ 'link')" "$real" 2>&1
+        if (-not (Test-Path -LiteralPath (Join-Path $host_ 'link'))) {
+            return 'SKIP'   # junctions unavailable here
+        }
+        return ((Get-PMPathSize -Path $host_) -eq 0)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'Get-PMPathSize returns a real size for a single file' {
+    # plex hands it individual .tmp files; DirectoryInfo on a file used to throw, report 0 bytes
+    # AND log a bogus read error that would flip a -Critical module to unverified.
+    $f = Join-Path ([IO.Path]::GetTempPath()) ("pm-f-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".txt")
+    Set-Content -LiteralPath $f -Value ('q' * 5000) -Encoding Ascii -NoNewline
+    try {
+        Clear-PMReadErrors
+        return ((Get-PMPathSize -Path $f) -eq 5000 -and (Get-PMReadErrorCount) -eq 0)
+    } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host "`n== HTML report ==" -ForegroundColor Cyan
@@ -278,5 +610,6 @@ It 'Downloads resolution never returns empty' {
     return (-not [string]::IsNullOrWhiteSpace($p))
 }
 
-Write-Host ("`n{0} passed, {1} failed`n" -f $script:Pass, $script:Fail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
+$tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }
+Write-Host ("`n{0} passed, {1} failed{2}`n" -f $script:Pass, $script:Fail, $tail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

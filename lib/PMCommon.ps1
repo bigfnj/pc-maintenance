@@ -127,6 +127,83 @@ function Test-PMPathSafe {
     return $false
 }
 
+function Test-PMPayloadSecure {
+    <#
+        Refuse to run from a directory a non-admin can write to.
+
+        This is not defence in depth, it is load-bearing. PMModule.ps1 dot-sources EVERY .ps1 in
+        lib\ into the phase scope, and this dispatcher runs as SYSTEM. C:\ProgramData inherits
+        BUILTIN\Users:(CI)(WD,AD) - create-file and create-subdirectory - so on a DEFAULT install
+        any standard user could drop lib\zz.ps1 and have SYSTEM execute it on the next weekly run.
+        They never need to touch a file that already exists, so a hash or signature check on the
+        shipped files would not have caught it either.
+
+        The installer hardens the ACL, but an install that skipped it, a hand-copied payload, or a
+        later ACL change must not silently re-open the hole, so the runtime refuses rather than
+        trusting the installer.
+
+        Returns the offending identities; an empty result means safe.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $bad = @()
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    } catch {
+        return @("cannot read the ACL: $($_.Exception.Message)")
+    }
+    # Anything that can introduce or alter a file here can run code as us.
+    $R = [System.Security.AccessControl.FileSystemRights]
+    # ONLY the write-ish bits. Modify and FullControl are composite values whose bit patterns
+    # INCLUDE the read rights, so folding them into a -band mask made plain ReadAndExecute match
+    # and every correctly hardened install was reported insecure. Note CreateFiles and WriteData
+    # are the same bit (2), as are CreateDirectories and AppendData (4), so both are covered.
+    $dangerous = $R::WriteData -bor $R::AppendData -bor $R::WriteAttributes -bor
+                 $R::WriteExtendedAttributes -bor $R::Delete -bor
+                 $R::DeleteSubdirectoriesAndFiles -bor $R::ChangePermissions -bor $R::TakeOwnership
+    # Principals already privileged enough that writing here grants them nothing new.
+    $trusted = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20', 'S-1-5-32-544', 'S-1-5-32-549', 'S-1-3-0')
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (-not ($ace.FileSystemRights -band $dangerous)) { continue }
+        $sid = $null
+        try {
+            $sid = if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+                $ace.IdentityReference.Value
+            } else {
+                $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+        } catch { $sid = [string]$ace.IdentityReference }
+        if ($trusted -contains $sid) { continue }
+        $bad += ('{0} ({1})' -f $ace.IdentityReference, $ace.FileSystemRights)
+    }
+    return $bad
+}
+
+function Set-PMPayloadAcl {
+    <#
+        Lock the payload down: inheritance OFF, SYSTEM and Administrators full, Users read+execute
+        only. Called by the installer while elevated. Kept beside the check it satisfies so the two
+        cannot drift apart.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)   # protect from inheritance, drop inherited ACEs
+    foreach ($r in @($acl.Access)) { $null = $acl.RemoveAccessRule($r) }
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+    $none = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    $R = [System.Security.AccessControl.FileSystemRights]
+    foreach ($grant in @(
+        @{ Sid = 'S-1-5-18';     Rights = $R::FullControl },
+        @{ Sid = 'S-1-5-32-544'; Rights = $R::FullControl },
+        @{ Sid = 'S-1-5-32-545'; Rights = $R::ReadAndExecute })) {
+        $id = New-Object System.Security.Principal.SecurityIdentifier($grant.Sid)
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $id, $grant.Rights, $inherit, $none, $allow)))
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 # --- filesystem readers (the test seam) -----------------------------------------------
 # Modules read state ONLY through these, so tests can fake a tree without touching a disk.
 #
@@ -215,12 +292,93 @@ function Test-PMPath { param([Parameter(Mandatory)][AllowEmptyString()][string]$
 }
 
 function Get-PMPathSize {
-    param([Parameter(Mandatory)][string]$Path)
+    <#
+        Reads .Length off the enumeration's own WIN32_FIND_DATA rather than re-stat'ing every
+        file: measured 25 ms against 78 ms for Get-ChildItem -Recurse | Measure-Object on a real
+        868-file directory. At 13,341 directories that is ~6 minutes instead of ~17.
+
+        It walks directories ITSELF instead of using AllDirectories, for a correctness reason that
+        cost a regression to learn: DirectoryInfo.EnumerateFiles(AllDirectories) FOLLOWS reparse
+        points, while Get-ChildItem -Recurse and Remove-Item -Recurse do not. Using it meant a
+        junction in TEMP had its target's whole tree counted, so the report's headline figure and
+        the "removed N GB" line were inflated by a tree that was never enumerated and never
+        deleted. Size must measure the same bytes deletion will actually free.
+
+        It also RECORDS what it could not read. It used to be the one reader that swallowed access
+        errors, which is the exact "silence looks like emptiness" failure the rest of this file
+        exists to prevent.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$Critical)
     if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
-    $s = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue |
-            Measure-Object Length -Sum).Sum
-    if ($null -eq $s) { return [int64]0 }
-    return [int64]$s
+
+    # A file is a legitimate thing to ask the size of - plex hands us individual .tmp files.
+    # DirectoryInfo on a file used to throw into the catch and report 0 bytes plus a bogus read
+    # error, which on a -Critical path would flip the whole module to unverified.
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (-not ($item.Attributes -band [IO.FileAttributes]::Directory)) { return [int64]$item.Length }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return [int64]0 }
+    } catch {
+        Add-PMReadError -Errors $_ -Critical:$Critical
+        return [int64]0
+    }
+
+    $total = [int64]0
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            foreach ($f in $di.EnumerateFiles()) { $total += [int64]$f.Length }
+            foreach ($sub in $di.EnumerateDirectories()) {
+                # Do not descend a junction or symlink: neither will the deletion.
+                if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                $stack.Push($sub.FullName)
+            }
+        } catch {
+            # One unreadable subtree must not abandon the rest of the count, and must not pass
+            # silently either. Continue rather than break, so the number is as complete as it can
+            # be and the caller still learns it is incomplete.
+            Add-PMReadError -Errors $_ -Critical:$Critical
+        }
+    }
+    return $total
+}
+
+function Expand-PMRoot {
+    <#
+        Expand a declared root from module.psd1 into a real path for THIS run.
+
+        Two steps, both necessary. %LOCALAPPDATA% and friends are expanded against the
+        INTERACTIVE user, not the running process - under SYSTEM the process variables point at
+        C:\Windows\system32\config\systemprofile and every declared root would silently miss.
+        Then reparse points are resolved, so a module whose directory is a junction to another
+        volume still matches the root it declared rather than failing the check it should pass.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Root, [string]$UserProfile)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return '' }
+    $r = $Root
+    if ($UserProfile) {
+        # A .NET replacement string only treats $ specially. Escaping backslashes here and
+        # then stripping them turned a profile path into a drive-relative one.
+        $r = $r -replace '(?i)%USERPROFILE%', ($UserProfile -replace '\$', '$$$$')
+        $r = $r -replace '(?i)%LOCALAPPDATA%', ($UserProfile + '\AppData\Local')
+        $r = $r -replace '(?i)%APPDATA%', ($UserProfile + '\AppData\Roaming')
+    }
+    $r = [Environment]::ExpandEnvironmentVariables($r)
+    if ($r -match '%[A-Za-z_]+%') { return '' }   # unresolved token: refuse rather than guess
+    return (Resolve-PMReparsePoint -Path $r)
+}
+
+function Get-PMDeclaredRoots {
+    param([Parameter(Mandatory)][hashtable]$ModuleInfo, [string]$UserProfile)
+    $out = @()
+    foreach ($r in @($ModuleInfo['Roots'])) {
+        $e = Expand-PMRoot -Root ([string]$r) -UserProfile $UserProfile
+        if ($e) { $out += $e }
+    }
+    return $out
 }
 
 function Remove-PMPath {
@@ -234,16 +392,29 @@ function Remove-PMPath {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Roots,
+        [AllowEmptyCollection()][string[]]$DeclaredRoots = @(),
+        [int64]$KnownBytes = -1,
         [switch]$WhatIfOnly,
         [int]$MinDepth = 3
     )
     if (-not (Test-PMPathSafe -Path $Path -Roots $Roots -MinDepth $MinDepth)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'refused by path guard'; Bytes = [int64]0 }
     }
+    # The SECOND, independent condition. $Roots above is supplied by the module at run time, so on
+    # its own it is self-certification: a module that computes the wrong root gets to delete there.
+    # $DeclaredRoots comes from module.psd1 via the dispatcher and the module cannot influence it.
+    # Fail CLOSED. Reading this as "no declared roots means no restriction" would make the
+    # independent half of the guard vanish exactly when a caller forgot to supply it.
+    if (-not @($DeclaredRoots).Count) {
+        return @{ Removed = $false; Skipped = $true; Reason = 'no declared roots supplied'; Bytes = [int64]0 }
+    }
+    if (-not (Test-PMPathSafe -Path $Path -Roots $DeclaredRoots -MinDepth $MinDepth)) {
+        return @{ Removed = $false; Skipped = $true; Reason = 'outside the roots this module declares'; Bytes = [int64]0 }
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'gone'; Bytes = [int64]0 }
     }
-    $bytes = Get-PMPathSize -Path $Path
+    $bytes = if ($KnownBytes -ge 0) { $KnownBytes } else { Get-PMPathSize -Path $Path }
     if ($WhatIfOnly) {
         return @{ Removed = $false; Skipped = $false; Reason = 'report-only'; Bytes = $bytes }
     }
@@ -251,7 +422,13 @@ function Remove-PMPath {
         Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
         return @{ Removed = $true; Skipped = $false; Reason = ''; Bytes = $bytes }
     } catch {
-        return @{ Removed = $false; Skipped = $true; Reason = "locked or in use: $($_.Exception.GetType().Name)"; Bytes = [int64]0 }
+        # Remove-Item -Recurse can delete most of a tree and then throw. Recording that as
+        # untouched is the one thing the audit trail must never get wrong, so re-measure.
+        $left = Get-PMPathSize -Path $Path
+        $partial = if (Test-Path -LiteralPath $Path) { $bytes - $left } else { $bytes }
+        if ($partial -lt 0) { $partial = [int64]0 }
+        return @{ Removed = $false; Skipped = $true; Bytes = $partial
+                  Reason = "partially removed then failed: $($_.Exception.GetType().Name)" }
     }
 }
 

@@ -64,16 +64,42 @@ try { Start-Transcript -Path $transcript | Out-Null } catch {}
 # Exclusive lock so a manual run and the weekly trigger never overlap on the same tree.
 $lockFile = Join-Path $PayloadRoot '.pm.lock'
 $lockStream = $null
+# Only CONTENTION is a benign exit. An UnauthorizedAccessException here means the payload root is
+# read-only or ACL-denied, and treating that as "another run holds the lock" would make a weekly
+# job that can no longer write to its own directory report success forever.
 try { $lockStream = [System.IO.File]::Open($lockFile, 'OpenOrCreate', 'ReadWrite', 'None') }
-catch {
+catch [System.IO.IOException] {
     Write-PMLog "Another pc-maintenance run holds $lockFile; exiting." 'WARN'
     try { Stop-Transcript | Out-Null } catch {}
     exit 0
+}
+catch {
+    Write-PMLog "cannot open the run lock at $lockFile - $($_.Exception.GetType().Name): $($_.Exception.Message)" 'ERROR'
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
+
+# Before anything else. We dot-source every .ps1 under lib\ and the scheduled task runs as
+# SYSTEM, so a payload directory a standard user can write to is arbitrary code execution as us.
+#
+# Scoped to a PRIVILEGED run on purpose. The risk is elevation: a low-privileged user planting a
+# file that a high-privileged process then executes. A normal user running this by hand out of a
+# directory that same user owns gains nothing they did not already have, and refusing there would
+# only push people toward a bypass switch - which would then be the hole.
+$insecure = if (Test-PMElevated) { @(Test-PMPayloadSecure -Path $PayloadRoot) } else { @() }
+if ($insecure.Count) {
+    Write-PMLog "REFUSING TO RUN: $PayloadRoot is writable by a non-administrator." 'ERROR'
+    foreach ($b in $insecure) { Write-PMLog "  $b" 'ERROR' }
+    Write-PMLog "Re-run Install-PcMaintenance.ps1 to harden it, or fix the ACL by hand." 'ERROR'
+    if ($lockStream) { try { $lockStream.Dispose() } catch {} }
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
 }
 
 $results = @()
 $summary = [ordered]@{ total = 0; clean = 0; found = 0; applied = 0; skipped = 0; unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
 
+$fatal = $null
 try {
     $mode = if ($Apply) { 'APPLY' } else { 'REPORT-ONLY' }
     Write-PMLog "=== pc-maintenance $DispatcherVersion (run $runId, $mode) ===" 'INFO'
@@ -90,7 +116,7 @@ try {
         $modId  = [string]$mod.id
         $modDir = Join-Path $modulesDir $modId
         $summary.total++
-        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0; readErrors = 0; partial = 0; items = @() }
+        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0; readErrors = 0; items = @() }
         try {
             $info = Import-PMModuleInfo -ModuleDir $modDir
 
@@ -105,16 +131,53 @@ try {
 
             # The second gate. A module is report-only unless BOTH sides agree.
             $mayApply = Test-PMApplyAllowed -Apply ([bool]$Apply) -ModuleInfo $info
+            $holdBack = $null
+
+            # A GUESSED user must never be deleted for. Get-PMInteractiveUserSid's last resort
+            # picks the first plausible profile out of the registry with no ordering guarantee and
+            # reports LoggedIn=$false. That is fine for reporting - a wrong number is visible and
+            # harmless - and not fine for removal, which on a multi-profile machine with nobody
+            # signed in would delete inside a stranger's Temp.
+            if ($mayApply -and -not (Test-PMActingUserConfirmed -RequiresUserSid ([bool]$info['RequiresUserSid']) -LoggedIn ([bool]$user.LoggedIn))) {
+                $mayApply = $false
+                $holdBack = 'the interactive user was inferred, not confirmed logged on'
+                Write-PMLog "$modId will report only - interactive user was inferred, not confirmed" 'SKIP'
+            }
+
+            # Declared roots, expanded against the INTERACTIVE user and junction-resolved. The
+            # module cannot influence these, which is what makes them an independent condition
+            # rather than the self-certification the run-time root alone provides.
+            $declaredRoots = Get-PMDeclaredRoots -ModuleInfo $info -UserProfile $user.Profile
+            if ($mayApply -and -not @($declaredRoots).Count) {
+                $mayApply = $false
+                $holdBack = 'the module declares no resolvable Roots'
+                Write-PMLog "$modId will report only - no resolvable declared Roots" 'WARN'
+            }
 
             $ctx = @{
                 UserSid = $user.Sid; UserProfile = $user.Profile
                 PayloadRoot = $PayloadRoot; ModuleRoot = $modDir; LibDir = $libDir
                 RunId = $runId; Apply = $mayApply
+                DeclaredRoots = $declaredRoots
                 IsInteractiveUserLoggedIn = $user.LoggedIn
             }
 
             $tw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Test -Context $ctx -LibDir $libDir -Entry $info.Entry
             $t = $tw.Result
+
+            # A module that returned NOTHING, or leaked extra output so the result is an array,
+            # must not be interpreted. Two distinct failures made this necessary:
+            #   $null    -> the clean branch below is falsy, so control fell through to found and
+            #               then to the DELETING phase: absence of an answer read as consent.
+            #   Object[] -> `$t.Count` silently resolves to the ARRAY's length instead of the
+            #               module's field, so a module reporting 940 was recorded as 2.
+            if ($null -eq $t -or $t -is [array] -or $null -eq $t.PSObject.Properties['Clean']) {
+                $shape = if ($null -eq $t) { 'nothing' } elseif ($t -is [array]) { "$(@($t).Count) objects" } else { 'no Clean field' }
+                $row.status = 'error'
+                $row.detail = "Test returned $shape; a module must return exactly one result object"
+                Write-PMLog "$modId ERROR - $($row.detail)" 'ERROR'
+                $summary.errors++; $results += $row; continue
+            }
             $row.readErrors = [int]$tw.ReadErrors
             $row.bytes = if ($null -ne $t.Bytes) { [int64]$t.Bytes } else { [int64]0 }
             $row.items = @($t.Items)
@@ -138,9 +201,9 @@ try {
             # PARTIAL coverage, not blindness. Recorded and shown, but they do not redden the run:
             # a permanent benign red is how a control gets ignored.
             if ($tw.ReadErrors -gt 0) {
-                $row.partial = [int]$tw.ReadErrors
                 $summary.partial += [int]$tw.ReadErrors
-                Write-PMLog "$modId partial coverage - $($tw.ReadErrors) location(s) unreadable" 'SKIP'
+                $row.detail += " [partial coverage: $($tw.ReadErrors) location(s) unreadable, e.g. $($tw.ReadErrorSample)]"
+                Write-PMLog "$modId partial coverage - $($tw.ReadErrors) unreadable, e.g. $($tw.ReadErrorSample)" 'SKIP'
             }
 
             if ($t.Clean) {
@@ -152,7 +215,12 @@ try {
             Write-PMLog ("{0} found {1} in {2} item(s) - {3}" -f $modId, (Format-PMBytes $row.bytes), $row.count, $t.Detail) 'WARN'
 
             if (-not $mayApply) {
-                $reason = if (-not $Apply) { 'report-only run' } else { "module does not declare AutoApply" }
+                # $holdBack is set where the decision was actually made. Recomputing it here always
+                # said "does not declare AutoApply", even when the real reason was an inferred user
+                # or an unresolvable declared root - and the run JSON is the audit trail.
+                $reason = if ($holdBack) { $holdBack }
+                          elseif (-not $Apply) { 'report-only run' }
+                          else { 'module does not declare AutoApply' }
                 $row.status = 'reported'; $row.detail += " [not removed: $reason]"
                 Write-PMLog "$modId not removed - $reason" 'SKIP'; $results += $row; continue
             }
@@ -176,19 +244,28 @@ try {
         }
         $results += $row
     }
+} catch {
+    # A throw before the module loop (missing manifest, malformed JSON) used to land in finally
+    # with errors = 0, exit 0, AND overwrite latest.json - so a job that could not read its own
+    # config was indistinguishable from a perfect run, and destroyed the last real record doing it.
+    $fatal = $_
+    Write-PMLog "FATAL: $($_.Exception.Message)" 'ERROR'
 } finally {
     # unverified is a real failure of the sweep's purpose, so it earns a non-zero exit too:
     # a weekly job that cannot see must not report success.
-    $exitCode = if ($summary.errors -gt 0 -or $summary.unverified -gt 0) { 1 } else { 0 }
+    $exitCode = if ($fatal -or $summary.errors -gt 0 -or $summary.unverified -gt 0) { 1 } else { 0 }
     $runObj = [ordered]@{
         runId = $runId; startedUtc = $startedUtc; finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
         version = $DispatcherVersion; mode = $(if ($Apply) { 'apply' } else { 'report' })
         modules = $results; summary = $summary; exitCode = $exitCode
+        fatal = if ($fatal) { [string]$fatal.Exception.Message } else { $null }
     }
     try {
         $json = $runObj | ConvertTo-Json -Depth 8
         $json | Set-Content -LiteralPath (Join-Path $logsDir "run-$runId.json") -Encoding UTF8
-        $json | Set-Content -LiteralPath (Join-Path $logsDir 'latest.json') -Encoding UTF8
+        # latest.json is only advanced by a run that actually got as far as the module loop.
+        # A config failure must not erase the last real record on its way out.
+        if (-not $fatal) { $json | Set-Content -LiteralPath (Join-Path $logsDir 'latest.json') -Encoding UTF8 }
     } catch { Write-PMLog "could not write run json: $($_.Exception.Message)" 'ERROR' }
 
     # The human-facing artifact, dropped where the owner will actually see it. Wrapped so a
@@ -211,8 +288,7 @@ try {
             $summary.unverified, $summary.errors, (Format-PMBytes $summary.bytes), $exitCode) $(if ($exitCode) { 'ERROR' } else { 'OK' })
 
     try {
-        $ret = $runObj.summary  # retention below is manifest-driven, read defensively
-        $maxRuns = 50; $maxAge = 30
+        $maxRuns = 50; $maxAge = 30   # only used if the manifest omits logRetention
         if ($manifest -and $manifest.PSObject.Properties['logRetention']) {
             if ($manifest.logRetention.maxRuns)    { $maxRuns = [int]$manifest.logRetention.maxRuns }
             if ($manifest.logRetention.maxAgeDays) { $maxAge  = [int]$manifest.logRetention.maxAgeDays }
@@ -226,7 +302,8 @@ try {
             Remove-Item -Force -EA SilentlyContinue
     } catch {}
 
-    if ($lockStream) { $lockStream.Close(); $lockStream.Dispose() }
+    # Dispose alone is enough, and it is wrapped: a throw here would skip Stop-Transcript below.
+    if ($lockStream) { try { $lockStream.Dispose() } catch {} }
     try { Stop-Transcript | Out-Null } catch {}
     exit $exitCode
 }

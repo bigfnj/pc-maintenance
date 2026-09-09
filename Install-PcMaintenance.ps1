@@ -70,6 +70,28 @@ foreach ($i in $items) {
 }
 New-Item -ItemType Directory -Path (Join-Path $PayloadRoot 'logs') -Force | Out-Null
 
+# Harden the ACL. C:\ProgramData inherits BUILTIN\Users:(CI)(WD,AD) - create-file and
+# create-subdirectory - and the dispatcher dot-sources every .ps1 under lib\ as SYSTEM. Without
+# this, any standard user could drop lib\zz.ps1 and have SYSTEM execute it on the next weekly
+# sweep, without ever touching a file that already exists.
+#
+# The dispatcher independently refuses to run from a writable payload, so this and that check must
+# agree; they live in the same lib file for exactly that reason.
+try {
+    Set-PMPayloadAcl -Path $PayloadRoot
+    Write-PMLog 'locked the payload ACL (SYSTEM + Administrators full, Users read-only)' 'OK'
+} catch {
+    Write-PMLog "could not harden the payload ACL: $($_.Exception.Message)" 'ERROR'
+    Write-PMLog 'the dispatcher will refuse to run until this is fixed' 'ERROR'
+    exit 1
+}
+$stillOpen = @(Test-PMPayloadSecure -Path $PayloadRoot)
+if ($stillOpen.Count) {
+    Write-PMLog 'ACL hardening did not take effect:' 'ERROR'
+    foreach ($b in $stillOpen) { Write-PMLog "  $b" 'ERROR' }
+    exit 1
+}
+
 # --- 2. scheduled task ----------------------------------------------------------------
 $xmlPath = Join-Path $SourceRoot 'task_template.xml'
 if (-not (Test-Path -LiteralPath $xmlPath)) { Write-PMLog 'task_template.xml missing' 'ERROR'; exit 1 }

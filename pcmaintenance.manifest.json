@@ -1,12 +1,7 @@
 {
   "schemaVersion": 1,
   "_comment": "pc-maintenance: ongoing Windows housekeeping as pluggable modules. Report-only unless the dispatcher gets -Apply AND the module declares AutoApply. Framework borrowed from a sibling project; the task cadence here is WEEKLY, with no Group Policy triggers, because nothing this tool watches is caused by a policy refresh.",
-  "task": {
-    "name": "PcMaintenance",
-    "weeklyDay": "Sunday",
-    "weeklyAt": "03:00:00",
-    "runIfMissed": true
-  },
+  "_task_note": "The schedule is NOT configured here. It lives in task_template.xml, which the installer substitutes and registers; the task name is a constant in Install-/Uninstall-PcMaintenance.ps1. A 'task' block here would look load-bearing and silently do nothing, so there deliberately is not one.",
   "allowedCategories": ["maintenance", "hygiene"],
   "logRetention": { "maxRuns": 50, "maxAgeDays": 90 },
   "modules": [

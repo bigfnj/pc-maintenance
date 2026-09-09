@@ -4,7 +4,6 @@
     Category          = 'maintenance'
     Version           = '1.0.0'
     RequiresUserSid   = $true
-    RequiresElevation = $false
     AutoApply         = $false
     Roots             = @('%LOCALAPPDATA%\Temp')
     Entry             = 'module.ps1'

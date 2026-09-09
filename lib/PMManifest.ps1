@@ -45,6 +45,22 @@ function Test-PMCategoryAllowed {
     return ($allowed -contains $cat)
 }
 
+function Test-PMActingUserConfirmed {
+    <#
+        May we DELETE on behalf of this user?
+
+        Get-PMInteractiveUserSid's last resort picks the first plausible profile out of the
+        registry in arbitrary order and reports LoggedIn = $false. That is fine for reporting - a
+        wrong number is visible and harmless - and not fine for removal, which on a multi-profile
+        machine with nobody signed in would delete inside a stranger's Temp.
+
+        A module that needs no user at all is unaffected.
+    #>
+    param([Parameter(Mandatory)][bool]$RequiresUserSid, [Parameter(Mandatory)][bool]$LoggedIn)
+    if (-not $RequiresUserSid) { return $true }
+    return $LoggedIn
+}
+
 function Test-PMApplyAllowed {
     <#
         Should this module actually delete on this run?

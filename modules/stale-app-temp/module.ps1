@@ -61,14 +61,29 @@ function Repair-PMModule {
     # wrong is worse than one that is never called.
     $root  = Get-StaleTempRoot -Context $Context
     $items = @(Get-StaleAppCandidates -Context $Context)
-    $freed = [int64]0; $removed = 0; $refused = 0
+    $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        $r = Remove-PMPath -Path $i.Path -Roots @($root) -WhatIfOnly:(-not $Context.Apply)
-        if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes }
-        elseif ($r.Skipped) { $refused++ }
+        # KnownBytes: the size was measured during Test, so re-walking the tree here would be a
+        # second full pass for a number we already hold.
+        $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
+                           -KnownBytes ([int64]$i.Bytes)
+        if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
+        # Reason matters: a path guard VETO is a governance event worth seeing, a file that
+        # vanished between Test and Repair is routine, and a locked file is neither.
+        switch -Wildcard ($r.Reason) {
+            '*refused*' { $vetoed++ }
+            '*outside*' { $vetoed++ }
+            'gone'      { $gone++ }
+            default     { $locked++ }
+        }
     }
+    # Ok reflects what actually happened. Returning $true unconditionally meant a run in which the
+    # guard refused every single target still rendered a green "Cleaned" badge.
+    $ok = ($vetoed -eq 0)
     [pscustomobject]@{
-        Changed = ($removed -gt 0); Ok = $true; Bytes = $freed
-        Detail  = ('removed {0} of {1}; {2} locked or refused' -f $removed, @($items).Count, $refused)
+        Ok     = $ok
+        Bytes  = $freed
+        Detail = ('removed {0} of {1}; {2} vetoed by the path guard, {3} locked, {4} already gone' -f
+                    $removed, @($items).Count, $vetoed, $locked, $gone)
     }
 }
