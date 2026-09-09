@@ -20,10 +20,10 @@ it reachable.
 
 ---
 
-## 1. The four modules have no behavioural tests
+## 1. Three of the four modules have no behavioural tests
 
-**Why first:** it is the only category with literally zero coverage, and it gates honest work on
-everything else. `vs-installer-scratch`'s three-condition identification rule decides whether tens
+**Why first:** it is the thinnest coverage in the tree, and it gates honest work on everything
+else. `vs-installer-scratch`'s three-condition identification rule decides whether tens
 of gigabytes of somebody's TEMP get deleted, and it is currently checked only by a regex over its
 own source text. The same goes for `plex-bif-orphans`' pairing rule and `stale-app-temp`'s
 allowlist and age floor. `agent-scratchpads` got real fixture tests when it was enabled, so it is
