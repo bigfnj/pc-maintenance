@@ -11,8 +11,8 @@ The modules have no behavioural tests at all, so item 1 comes first: every other
 list touches code that nothing currently verifies, and doing them in the other order means fixing
 guards while unable to tell whether a module still works. After that, the path-pattern gaps (2)
 are a single batch in a single file with one test shape, and they are worth closing *before* a new
-module makes them reachable rather than after. Item 3 is done. Item 4 needs a design decision and
-has the lowest reachability, so it goes last.
+module makes them reachable rather than after. Items 3 and 4 are settled: 3 shipped, 4 was closed
+as won't-fix once the threat model was pinned down.
 
 Nothing still open here is reachable through the four shipped modules today. That is the reason
 none of it is urgent, and also the reason it is easy to leave until a fifth module quietly makes
@@ -81,10 +81,9 @@ sequence was eaten as an escape, so the directory the test claimed to create nev
 the test passed no matter what. The patch script asserted its *anchor* matched; it did not
 verify the *replacement* landed. Assert both.
 
-## 4. TOCTOU inside `Remove-PMPath`
+## 4. ~~TOCTOU inside `Remove-PMPath`~~ WON'T FIX 2026-09-09, with the reason recorded
 
-Measured 2026-09-09 rather than assumed, because the original entry overstated it. Three cases,
-all run on this build:
+Measured on this build rather than assumed, because the original entry overstated it:
 
 | case | what was tried | victim |
 |---|---|---|
@@ -92,34 +91,40 @@ all run on this build:
 | B | the swept path itself swapped for a junction after the guard ran | **survived** |
 | C | deleting a path that TRAVERSES a junction to a real file | **destroyed** |
 
-So `Remove-Item -Recurse` deletes the reparse point, not the target, which kills the textbook
-attack. **Only case C works**, and reaching it needs a module to hand `Remove-PMPath` a path that
-goes *through* a link. `Get-ChildItem -Recurse` does not descend junctions (measured: 0 files
-found under a directory containing one), so no module can enumerate such a path.
+`Remove-Item -Recurse` deletes the reparse point, not the target, which kills the textbook attack.
+Only case C works, and reaching it needs a module to hand `Remove-PMPath` a path that goes through
+a link. `Get-ChildItem -Recurse` does not descend junctions (measured: zero files found under a
+directory containing one), so no module can enumerate one. That leaves a single route: the one
+module that deletes individual FILES rather than directories, with an attacker swapping an
+intermediate directory between Test and Repair.
 
-That leaves one real route: a module that deletes individual FILES, where an attacker swaps an
-intermediate directory for a junction between Test and Repair. Of the four, only
-`plex-bif-orphans` deletes files rather than directories. The attack needs write access to the
-Plex media cache, timing inside the Test-to-Repair window, and a victim file whose leaf name
-matches the `.tmp` being removed.
+**Closed because the deployment is a single-user workstation whose interactive user is the
+administrator.** The distinction that decided it is worth keeping, because it is NOT the same
+answer for every finding in this project:
 
-**What it is worth depends entirely on the threat model.** On a single-user workstation where the
-interactive user is an administrator, anyone who can create a junction in that tree can already
-run code as themselves, and SYSTEM is not a boundary they need to cross. It matters only if the
-interactive user is a standard user and SYSTEM is a privilege boundary worth defending.
+- **The ProgramData ACL hole was worth fixing** even here. Non-elevated code running as the user
+  (a compromised app, a malicious dependency) could write to a default-ACL ProgramData directory,
+  and the dispatcher dot-sources every `.ps1` there as SYSTEM. That is arbitrary **code execution
+  as SYSTEM**, which is strictly more than the user has without elevating.
+- **This one is not.** The same attacker gets the deletion of *one file* whose leaf name matches a
+  `.tmp` being swept. It grants no code execution, and non-elevated code can already delete
+  anything the user can. The marginal gain is destroying a file only SYSTEM could delete, which is
+  a denial-of-service primitive, not an escalation.
 
-**Options, cheapest first:**
+Spending twenty lines and a test to narrow a window that buys an attacker nothing they want is the
+kind of risk-shaped work that looks diligent and is not.
 
-1. **Re-check the ancestors immediately before deleting.** Walk from the target up to the declared
-   root asserting nothing is a reparse point, right before `Remove-Item`. Narrows the window to
-   microseconds, stays in plain PowerShell, maybe 20 lines. Does not close it.
-2. **Delete files by handle.** Open with `FILE_FLAG_OPEN_REPARSE_POINT`, verify, then delete
-   through that handle. Closes it properly for the file case, needs P/Invoke.
-3. **Accept it and write down why.** Defensible on a single-admin box, and the honest option if
-   the threat model does not include a hostile local user.
+**Reopen this if any of these become true:**
 
-I would take (1) unless the threat model says otherwise: most of the benefit, none of the
-complexity, and it keeps the tool auditable, which is a real part of its value.
+- the interactive user stops being an administrator, so SYSTEM becomes a boundary worth defending
+- the machine gains a second, less-trusted user
+- a module starts deleting individual files somewhere a *different* user can write
+- it is deployed anywhere but this workstation
+
+The cheap mitigation, if it ever is reopened: walk from the target up to the declared root
+asserting nothing is a reparse point, immediately before `Remove-Item`. Narrows the window to
+microseconds in about twenty lines of plain PowerShell without reaching for P/Invoke. It does not
+close it; closing it properly means deleting by handle opened with `FILE_FLAG_OPEN_REPARSE_POINT`.
 
 ---
 
