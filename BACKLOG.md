@@ -1,0 +1,112 @@
+# Backlog
+
+Open work, in the order I would do it, with the reasoning for that order rather than just a list.
+Everything here came out of the 2026-09-09 audit round unless noted.
+
+## How to work this list
+
+**Coverage before change, latent-safety before capability, design decisions last.**
+
+The modules have no behavioural tests at all, so item 1 comes first: every other change on this
+list touches code that nothing currently verifies, and doing them in the other order means fixing
+guards while unable to tell whether a module still works. After that, the path-pattern gaps (2)
+are a single batch in a single file with one test shape, and they are worth closing *before* a new
+module makes them reachable rather than after. Item 3 is the only one that adds a capability
+rather than protecting one. Item 4 needs a design decision and has the lowest reachability, so it
+goes last.
+
+Nothing here is reachable through the four shipped modules today. That is the reason none of it is
+urgent, and also the reason it is easy to leave until a fifth module quietly makes it reachable.
+
+---
+
+## 1. The four modules have no behavioural tests
+
+**Why first:** it is the only category with literally zero coverage, and it gates honest work on
+everything else. `vs-installer-scratch`'s three-condition identification rule decides whether tens
+of gigabytes of somebody's TEMP get deleted, and it is currently checked only by a regex over its
+own source text. The same goes for `plex-bif-orphans`' pairing rule, `stale-app-temp`'s allowlist
+and age floor, and `agent-scratchpads`' deliberate refusal to act.
+
+**Shape:** a fixture tree per module, run `Test-PMModule` against it, assert exactly which paths
+come back. That also retires the three source-text greps in the suite, which pass whether or not
+the thing they describe still works.
+
+**Watch for:** `agent-scratchpads`' `Repair-PMModule` returns `Ok = $false` on purpose. A test
+must assert that refusal, not treat it as a bug.
+
+## 2. The path guard reads broader than it is
+
+Four gaps, all measured, none reachable today because every path handed to `Remove-PMPath` comes
+from `Get-ChildItem`'s `.FullName`. Do them as one batch: same file, same test shape, one commit.
+
+- **OneDrive Known Folder Move.** `'^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|...)'` only
+  matches a direct child of the profile. KFM is the Windows 11 default, so the real Documents,
+  Desktop and Pictures sit under `...\OneDrive\...` and are unprotected. Measured:
+  `C:\Users\Someone\OneDrive\Documents\tax` returns **safe**.
+- **UNC forms.** `'\\wsl\\'` matches a directory literally named `wsl`, not `\\wsl$\Ubuntu\...`
+  or `\\wsl.localhost\...`, both of which measure **safe**. `MinDepth = 3` is also much weaker on
+  a share, where `\\server\share\folder` is already three segments.
+- **The `\\?\` prefix** defeats every `^[A-Za-z]:\\`-anchored pattern at once, so the entire
+  forbidden list would silently stop applying if long-path handling were ever added.
+- **`AppData\Roaming` is uncovered entirely** (`.ssh`, `.aws`, browser profiles,
+  `Microsoft\Crypto\RSA`).
+
+**Add one test per pattern.** The suite already does this for the current entries; the gap is that
+the entries themselves are incomplete, not that they are untested.
+
+## 3. A liveness check so `agent-scratchpads` can act
+
+**The prize:** 3.75 GB across ~940 idle sessions today, growing every session, currently
+report-only forever.
+
+**The blocker, restated so nobody solves the wrong problem:** directory mtime is not a liveness
+signal. An agent session can sit idle for hours between turns and then resume, so any age floor
+will eventually delete a live session's working directory mid-task. **A longer timeout is not the
+fix** — it only makes the failure rarer and much harder to attribute.
+
+**What would actually work:** an open handle on the session directory, or a pid file the agent
+maintains and the module checks. Until one of those exists this stays at `AutoApply = $false`, and
+its `Repair` should keep refusing even if called.
+
+## 4. TOCTOU inside `Remove-PMPath`
+
+Between `Test-PMPathSafe`, the `Test-Path`, and the `Remove-Item` there is a window in which an
+intermediate directory can be swapped for a junction, and the swept trees live under
+`%LOCALAPPDATA%\Temp`, which the interactive user owns. A deliberate local attacker could have
+SYSTEM delete an arbitrary file.
+
+**Why last:** it needs interactive access already, no shipped module can produce such a path, and
+the fix is a real design decision rather than a patch — most likely opening a handle with
+`FILE_FLAG_OPEN_REPARSE_POINT` and operating on that, which changes the removal path for every
+module. Worth doing deliberately, not squeezed in.
+
+---
+
+## Smaller, and genuinely optional
+
+- `Format-PMBytes` renders anything under 512 bytes as `0 KB` and has no TB tier, so a 2 TB sweep
+  would print `2048.00 GB`.
+- Log retention omits `-File`, so a subdirectory under `logs\` would match; `-Force` without
+  `-Recurse` then fails silently. It also deletes outside the path guard.
+- `Get-PMInteractiveUserSid`'s header comment says no user is guessed. Its third fallback does
+  guess, in arbitrary registry order. Deletion is correctly blocked for an inferred user now, but
+  **the comment is still wrong** and reporting does run against whichever profile it picked.
+- `Get-PMForbiddenPathPatterns` and `Get-PMForbiddenCategories` are defined and never called. They
+  are exactly the accessors a test would need to assert the two hard-coded lists have not been
+  quietly edited, so their deadness marks a missing test rather than dead weight to remove.
+- `-KeepLogs` on the uninstaller is a silent no-op unless `-RemoveFiles` is also passed.
+
+## Decisions worth revisiting later, not bugs
+
+- **Should a weekly job speak when it finds nothing?** It currently writes a report every run. A
+  job that always speaks becomes background noise, and one that only speaks on a threshold can be
+  quietly broken for months. No obvious right answer; revisit once there is a few months of real
+  run history to look at.
+- **Promoting entries out of `stale-app-temp`.** The right move is to graduate one application at
+  a time into its own module once its behaviour has been watched long enough to state a mechanical
+  rule for it. Flipping the whole allowlist to `AutoApply` would be trusting every entry at once,
+  which is exactly what the two-tier design exists to prevent.
+- **A third consumer of the module framework.** It is currently shared by copy with a sibling
+  project. That is fine at two and starts costing at three; if a third appears, extracting the
+  engine becomes worth doing rather than premature.

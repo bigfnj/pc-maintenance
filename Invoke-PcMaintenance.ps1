@@ -116,7 +116,8 @@ try {
         $modId  = [string]$mod.id
         $modDir = Join-Path $modulesDir $modId
         $summary.total++
-        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0; readErrors = 0; items = @() }
+        $row = [ordered]@{ id = $modId; status = 'unknown'; detail = ''; bytes = [int64]0; count = 0
+                           readErrors = 0; readErrorMessages = @(); items = @() }
         try {
             $info = Import-PMModuleInfo -ModuleDir $modDir
 
@@ -179,6 +180,7 @@ try {
                 $summary.errors++; $results += $row; continue
             }
             $row.readErrors = [int]$tw.ReadErrors
+            $row.readErrorMessages = @($tw.ReadErrorMessages)
             $row.bytes = if ($null -ne $t.Bytes) { [int64]$t.Bytes } else { [int64]0 }
             $row.items = @($t.Items)
             # Count is the TRUE number found. Items is capped by some modules so a 6,935-orphan
@@ -272,12 +274,20 @@ try {
     # report failure can never turn a clean sweep into a failed run: the sweep is the work, the
     # report is the delivery, and losing the delivery is worth a WARN, not an exit code.
     if (-not $NoReport) {
+        $reportsToKeep = 2
+        if ($manifest -and $manifest.PSObject.Properties['reportsToKeep']) {
+            $reportsToKeep = [int]$manifest.reportsToKeep
+        }
         try {
             $dl = Get-PMDownloadsPath -UserSid $user.Sid -UserProfile $user.Profile
-            $stamp = (Get-Date -Format 'yyyy-MM-dd HHmmss')
-            $reportPath = Join-Path $dl ("PC-Maintenance Report - $stamp.html")
+            $reportPath = Join-Path $dl (Get-PMReportFileName -When (Get-Date))
             $null = New-PMHtmlReport -Run $runObj -OutPath $reportPath
             Write-PMLog "report: $reportPath" 'OK'
+            # Keep this run and the one before it, so the delta is readable without Downloads
+            # filling up. Strictly name-matched; see Remove-PMOldReports for why this does not
+            # and must not go through the path guard.
+            $pruned = @(Remove-PMOldReports -Directory $dl -Keep $reportsToKeep)
+            if ($pruned.Count) { Write-PMLog "removed $($pruned.Count) older report(s)" 'CHANGE' }
         } catch {
             Write-PMLog "could not write the HTML report: $($_.Exception.Message)" 'WARN'
         }

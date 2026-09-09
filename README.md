@@ -107,6 +107,19 @@ commonly redirected). Self-contained means no CDN, no webfont and no JS library:
 opened offline, possibly months later, and a test asserts the output contains no external fetch.
 It renders from the same object as the JSON, so the two can never disagree.
 
+**Every number opens.** Each stat tile is a `<details>` element: click or tab to it and it expands
+to the rows it counted, with a sentence explaining what that number means. A count nobody can
+expand is a count nobody can act on. `<details>` rather than script keeps the file dependency-free
+and keyboard-accessible, and it prints expanded.
+
+**Only the two most recent reports are kept**, so Downloads holds the current sweep and the one
+before it and the week-over-week delta stays readable. That deletion does *not* go through the
+path guard, deliberately: Downloads is on the forbidden list precisely so no module can reach it,
+and widening the guard would trade a convenience for the broadest hole in the tool. Instead
+`Remove-PMOldReports` has a far stricter rule of its own - the exact generated filename pattern,
+files only, no recursion, ordered by the timestamp in the name rather than mtime so a touched file
+cannot promote itself past a newer one. Set `reportsToKeep` in the manifest to change it.
+
 ## Tests
 
 ```powershell
@@ -120,6 +133,8 @@ reason, and says so loudly if you run it under 7.
 96 tests elevated, 95 plus one honest SKIP otherwise. A skip is counted and printed separately
 rather than folded into the pass total: a check that reports success while verifying nothing is
 the exact failure this project exists to catch, so the suite must not commit it either.
+
+Open work and the order I would do it in: [BACKLOG.md](BACKLOG.md).
 
 ## Layout
 

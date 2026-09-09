@@ -554,6 +554,109 @@ It 'Get-PMPathSize returns a real size for a single file' {
     } finally { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== report retention (this deletes inside Downloads, so it is fenced hard) ==" -ForegroundColor Cyan
+function New-PMReportDir {
+    param([string[]]$Names)
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-rep-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    foreach ($n in $Names) { Set-Content -LiteralPath (Join-Path $d $n) -Value 'x' -Encoding UTF8 }
+    return $d
+}
+It 'keeps the newest two and removes the rest' {
+    $d = New-PMReportDir @(
+        'PC-Maintenance Report - 2026-09-01 010101.html'
+        'PC-Maintenance Report - 2026-09-08 020202.html'
+        'PC-Maintenance Report - 2026-09-15 030303.html'
+        'PC-Maintenance Report - 2026-09-22 040404.html')
+    try {
+        $removed = @(Remove-PMOldReports -Directory $d -Keep 2)
+        $left = @(Get-ChildItem -LiteralPath $d -File | ForEach-Object { $_.Name } | Sort-Object)
+        return ($removed.Count -eq 2 -and $left.Count -eq 2 -and
+                $left[0] -eq 'PC-Maintenance Report - 2026-09-15 030303.html' -and
+                $left[1] -eq 'PC-Maintenance Report - 2026-09-22 040404.html')
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'orders by the timestamp IN THE NAME, not by mtime' {
+    # A report that gets touched, copied or restored must not be able to promote itself past a
+    # genuinely newer one and get the newer one deleted instead.
+    $d = New-PMReportDir @(
+        'PC-Maintenance Report - 2026-01-01 010101.html'
+        'PC-Maintenance Report - 2026-09-15 030303.html'
+        'PC-Maintenance Report - 2026-09-22 040404.html')
+    try {
+        # make the OLDEST file the most recently written
+        (Get-Item -LiteralPath (Join-Path $d 'PC-Maintenance Report - 2026-01-01 010101.html')).LastWriteTime = (Get-Date)
+        $null = Remove-PMOldReports -Directory $d -Keep 2
+        return (-not (Test-Path -LiteralPath (Join-Path $d 'PC-Maintenance Report - 2026-01-01 010101.html')) -and
+                (Test-Path -LiteralPath (Join-Path $d 'PC-Maintenance Report - 2026-09-22 040404.html')))
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'touches nothing that is not one of our reports' {
+    # This runs inside the user's Downloads, which is on the FORBIDDEN path list for every module.
+    # The only thing standing between it and someone's files is the name pattern, so the pattern
+    # is what gets tested hardest.
+    $bystanders = @(
+        'tax return 2026.pdf'
+        'PC-Maintenance Report.html'                          # no timestamp
+        'PC-Maintenance Report - 2026-09-01.html'             # date only
+        'PC-Maintenance Report - 2026-09-01 010101.html.bak'  # wrong extension
+        'my PC-Maintenance Report - 2026-09-01 010101.html'   # prefixed
+        'PC-Maintenance Report - not-a-date 010101.html'
+    )
+    $d = New-PMReportDir ($bystanders + @(
+        'PC-Maintenance Report - 2026-09-01 010101.html'
+        'PC-Maintenance Report - 2026-09-08 020202.html'
+        'PC-Maintenance Report - 2026-09-15 030303.html'))
+    try {
+        $null = Remove-PMOldReports -Directory $d -Keep 2
+        foreach ($b in $bystanders) { if (-not (Test-Path -LiteralPath (Join-Path $d $b))) { return $false } }
+        return $true
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'does nothing when there are not more than Keep' {
+    $d = New-PMReportDir @('PC-Maintenance Report - 2026-09-15 030303.html')
+    try { return ((@(Remove-PMOldReports -Directory $d -Keep 2)).Count -eq 0) }
+    finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'never recurses into a subdirectory' {
+    $d = New-PMReportDir @()
+    $sub = Join-Path $d 'nested'
+    New-Item -ItemType Directory -Path $sub -Force | Out-Null
+    foreach ($n in @('PC-Maintenance Report - 2026-09-01 010101.html',
+                     'PC-Maintenance Report - 2026-09-08 020202.html',
+                     'PC-Maintenance Report - 2026-09-15 030303.html')) {
+        Set-Content -LiteralPath (Join-Path $sub $n) -Value 'x' -Encoding UTF8
+    }
+    try {
+        $null = Remove-PMOldReports -Directory $d -Keep 1
+        return ((@(Get-ChildItem -LiteralPath $sub -File)).Count -eq 3)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a directory named like a report is not deleted' {
+    $d = New-PMReportDir @('PC-Maintenance Report - 2026-09-15 030303.html'
+                           'PC-Maintenance Report - 2026-09-22 040404.html')
+    $trap = Join-Path $d 'PC-Maintenance Report - 2026-09-01 010101.html'
+    New-Item -ItemType Directory -Path $trap -Force | Out-Null
+    try {
+        $null = Remove-PMOldReports -Directory $d -Keep 1
+        return (Test-Path -LiteralPath $trap)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'Keep is floored at 1, so a bad value cannot wipe every report' {
+    $d = New-PMReportDir @('PC-Maintenance Report - 2026-09-15 030303.html'
+                           'PC-Maintenance Report - 2026-09-22 040404.html')
+    try {
+        $null = Remove-PMOldReports -Directory $d -Keep 0
+        return ((@(Get-ChildItem -LiteralPath $d -File)).Count -eq 1)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'the generated name matches the pattern the pruner looks for' {
+    # If these two ever drift, the tool writes reports it can never clean up.
+    $n = Get-PMReportFileName -When ([datetime]'2026-09-09T13:57:13')
+    return ($n -eq 'PC-Maintenance Report - 2026-09-09 135713.html' -and
+            $n -match $script:PMReportNamePattern)
+}
+
 Write-Host "`n== HTML report ==" -ForegroundColor Cyan
 $fakeRun = [ordered]@{
     runId = 'test-run'; startedUtc = (Get-Date).ToUniversalTime().ToString('o')

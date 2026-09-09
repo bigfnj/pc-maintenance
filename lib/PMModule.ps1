@@ -52,6 +52,7 @@ function Invoke-PMModulePhase {
             ReadErrors        = (Get-PMReadErrorCount)
             CriticalReadErrors = (Get-PMCriticalReadErrorCount)
             ReadErrorSample   = (Get-PMReadErrorSample)
+            ReadErrorMessages = (Get-PMReadErrorMessages)
         }
     } $LibDir $entryPath $Context $Phase
 }

@@ -4,6 +4,8 @@
   "_task_note": "The schedule is NOT configured here. It lives in task_template.xml, which the installer substitutes and registers; the task name is a constant in Install-/Uninstall-PcMaintenance.ps1. A 'task' block here would look load-bearing and silently do nothing, so there deliberately is not one.",
   "allowedCategories": ["maintenance", "hygiene"],
   "logRetention": { "maxRuns": 50, "maxAgeDays": 90 },
+  "_reportsToKeep_note": "How many HTML dashboards to leave in the user's Downloads. 2 keeps this run and the one before it, which is what makes the week-over-week delta readable without Downloads filling up.",
+  "reportsToKeep": 2,
   "modules": [
     { "id": "vs-installer-scratch", "enabled": true, "order": 10 },
     { "id": "plex-bif-orphans",     "enabled": true, "order": 20 },

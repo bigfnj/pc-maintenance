@@ -46,6 +46,58 @@ function Get-PMDownloadsPath {
     return $env:TEMP
 }
 
+$script:PMReportNamePattern = '^PC-Maintenance Report - (\d{4}-\d{2}-\d{2}) (\d{6})\.html$'
+
+function Get-PMReportFileName {
+    param([Parameter(Mandatory)][datetime]$When)
+    'PC-Maintenance Report - ' + $When.ToString('yyyy-MM-dd HHmmss') + '.html'
+}
+
+function Remove-PMOldReports {
+    <#
+        Keep only the newest N reports, so Downloads holds the current sweep and the one before it
+        and you can read the delta without a pile of stale files.
+
+        This deliberately does NOT go through Remove-PMPath. Downloads is on the forbidden-path
+        list precisely so no module can ever reach it, and widening that guard to let this through
+        would trade a narrow convenience for the broadest hole in the tool. Instead this is its own
+        much stricter rule, and it can only ever match files THIS tool wrote:
+
+          - the name must match the exact generated pattern, timestamp and all
+          - it must be a file, not a directory and not a reparse point
+          - it must sit directly in the given directory; nothing recurses
+          - ordering comes from the TIMESTAMP IN THE NAME, not mtime, because a file that gets
+            touched or copied must not be able to promote itself past a newer report
+
+        Returns the paths removed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [int]$Keep = 2
+    )
+    if ($Keep -lt 1) { $Keep = 1 }
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return @() }
+
+    $reports = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $Directory -File -Force -ErrorAction SilentlyContinue)) {
+        $m = [regex]::Match($f.Name, $script:PMReportNamePattern)
+        if (-not $m.Success) { continue }
+        if ($f.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        # Sort key straight from the name: '2026-09-09' + '135713' sorts correctly as text.
+        $reports += [pscustomobject]@{ Path = $f.FullName; Key = ($m.Groups[1].Value + $m.Groups[2].Value) }
+    }
+    if ($reports.Count -le $Keep) { return @() }
+
+    $removed = @()
+    foreach ($r in (@($reports | Sort-Object Key -Descending) | Select-Object -Skip $Keep)) {
+        try {
+            Remove-Item -LiteralPath $r.Path -Force -ErrorAction Stop
+            $removed += $r.Path
+        } catch { }
+    }
+    return $removed
+}
+
 function ConvertTo-PMHtml {
     # Paths are user data and can contain & < > " - escape before interpolating, or a directory
     # named with an angle bracket silently breaks the document.
@@ -68,6 +120,48 @@ function Get-PMStatusPresentation {
         default    { @{ Role = 'muted';    Icon = '?';    Word = $Status } }
     }
 }
+
+function Get-PMTileRows {
+    <#
+        Turn a summary tile into the actual rows behind it.
+
+        A number nobody can expand is a number nobody can act on: "Unreadable: 1" told a reader
+        there was one of something, without saying what, where, or whether it mattered. Each tile
+        now carries the rows it counted, so the count and the evidence can never disagree - the
+        tile value IS the row count, not a separately-maintained number.
+    #>
+    param([Parameter(Mandatory)][string]$Kind, [Parameter(Mandatory)]$Modules)
+    $rows = @()
+    foreach ($m in @($Modules)) {
+        $bytes = if ($m.bytes) { [int64]$m.bytes } else { [int64]0 }
+        switch ($Kind) {
+            'total' {
+                $rows += @{ K = $m.id; V = (Get-PMStatusPresentation -Status ([string]$m.status)).Word; D = [string]$m.detail }
+            }
+            'clean'      { if ($m.status -eq 'clean')      { $rows += @{ K = $m.id; V = 'nothing to do'; D = [string]$m.detail } } }
+            'found'      { if ($m.status -eq 'reported')   { $rows += @{ K = $m.id; V = (Format-PMBytes $bytes); D = [string]$m.detail } } }
+            'applied'    { if ($m.status -eq 'applied')    { $rows += @{ K = $m.id; V = (Format-PMBytes $bytes) + ' freed'; D = [string]$m.detail } } }
+            'skipped'    { if ($m.status -eq 'skipped')    { $rows += @{ K = $m.id; V = 'not run'; D = [string]$m.detail } } }
+            'unverified' { if ($m.status -eq 'unverified') { $rows += @{ K = $m.id; V = 'could not check'; D = [string]$m.detail } } }
+            'errors'     { if ($m.status -eq 'error')      { $rows += @{ K = $m.id; V = 'failed'; D = [string]$m.detail } } }
+            'partial' {
+                foreach ($msg in @($m.readErrorMessages)) { $rows += @{ K = $m.id; V = ''; D = [string]$msg } }
+            }
+        }
+    }
+    return $rows
+}
+
+$script:PMTileSpec = @(
+    @{ Kind = 'total';      Label = 'Modules run';    Blurb = 'Every module in the manifest, and how each one finished.' }
+    @{ Kind = 'clean';      Label = 'Clean';          Blurb = 'Looked, found nothing to remove.' }
+    @{ Kind = 'found';      Label = 'Found';          Blurb = 'Found something and left it alone, because this run or this module is not allowed to act.' }
+    @{ Kind = 'applied';    Label = 'Cleaned up';     Blurb = 'Actually deleted something.' }
+    @{ Kind = 'skipped';    Label = 'Skipped';        Blurb = 'Did not run at all: the category is not permitted, or it needs a logged-on user and there was none.' }
+    @{ Kind = 'unverified'; Label = 'Could not check'; Blurb = 'Could not read the place it is responsible for, so "clean" would have been a guess. This is why the run reports failure.' }
+    @{ Kind = 'partial';    Label = "Couldn't read";  Blurb = 'Individual spots that were locked or access-denied while scanning. The rest of the sweep is still valid; these are simply not covered.' }
+    @{ Kind = 'errors';     Label = 'Errors';         Blurb = 'A module threw, or its removal was refused by the path guard.' }
+)
 
 $script:PMReportCss = @'
 :root {
@@ -124,12 +218,43 @@ h1 { font-size:22px; font-weight:600; margin:0; letter-spacing:-0.01em; }
 .hero .label { color:var(--ink-2); font-size:14px; margin:0 0 6px; }
 .hero .value { font-size:52px; font-weight:600; line-height:1.05; letter-spacing:-0.02em; margin:0; }
 .hero .note { color:var(--muted); font-size:13px; margin:8px 0 0; }
-.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:28px; }
+.hint { color:var(--muted); font-size:13px; margin:0 0 10px; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:28px;
+         align-items:start; }
 .tile {
-  background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:16px 18px;
+  background:var(--surface); border:1px solid var(--border); border-radius:10px;
 }
-.tile .label { color:var(--ink-2); font-size:13px; margin:0 0 4px; }
-.tile .value { font-size:26px; font-weight:600; margin:0; letter-spacing:-0.01em; }
+.tile > summary {
+  list-style:none; cursor:pointer; padding:16px 18px; position:relative; border-radius:10px;
+  display:block;
+}
+.tile > summary::-webkit-details-marker { display:none; }
+.tile > summary::after {
+  content:''; position:absolute; right:16px; top:22px;
+  width:7px; height:7px; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted);
+  transform:rotate(45deg); transition:transform .12s ease;
+}
+.tile[open] > summary::after { transform:rotate(-135deg); }
+/* An open tile takes the full row. In a plain grid it would stretch its row's height and leave
+   the neighbours floating in dead space, and the paths inside need the width anyway. */
+.tile[open] { grid-column:1 / -1; }
+.tile[open] .rows li { display:grid; grid-template-columns:minmax(140px,auto) minmax(90px,auto) 1fr;
+                       gap:12px; align-items:baseline; }
+.tile[open] .rows .rd { display:inline; margin-top:0; }
+.tile > summary:hover { background:rgba(127,127,127,0.06); }
+.tile > summary:focus-visible { outline:2px solid var(--bar); outline-offset:2px; }
+.tile .label { display:block; color:var(--ink-2); font-size:13px; margin:0 0 4px; }
+.tile .value { display:block; font-size:26px; font-weight:600; margin:0; letter-spacing:-0.01em; }
+.tile.empty .value { color:var(--muted); }
+.drawer { padding:0 18px 16px; border-top:1px solid var(--rule); margin-top:2px; }
+.blurb { color:var(--ink-2); font-size:13px; margin:12px 0 10px; }
+.rows { list-style:none; margin:0; padding:0; }
+.rows li { padding:7px 0; border-top:1px solid var(--rule); font-size:13px; }
+.rows .rk { font-weight:600; }
+.rows .rv { color:var(--ink-2); margin-left:8px; font-variant-numeric:tabular-nums; }
+.rows .rd { display:block; color:var(--muted); font-size:12px; margin-top:2px; word-break:break-word; }
+.rows-empty { color:var(--muted); font-size:13px; margin:12px 0 0; }
+@media print { .tile > summary::after { display:none } .drawer { display:block !important } }
 h2 { font-size:14px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em;
      color:var(--ink-2); margin:0 0 12px; }
 .card {
@@ -211,18 +336,30 @@ function New-PMHtmlReport {
     [void]$sb.AppendLine('<p class="value">' + (ConvertTo-PMHtml (Format-PMBytes $totalBytes)) + '</p>')
     [void]$sb.AppendLine('<p class="note">' + $heroNote + '</p></div>')
 
-    $s = $Run.summary
+    # Every tile is a <details>: click or keyboard to expand the rows behind the number. Chosen
+    # over any JS because the file is opened offline from Downloads, and <details> also survives
+    # printing and screen readers without a line of script.
+    [void]$sb.AppendLine('<p class="hint">Every number below opens. Click one to see what it counted.</p>')
     [void]$sb.AppendLine('<div class="tiles">')
-    foreach ($t in @(
-        @{ L = 'Modules run'; V = $s.total },
-        @{ L = 'Clean';       V = $s.clean },
-        @{ L = 'Found';       V = $s.found },
-        @{ L = 'Acted on';    V = $s.applied },
-        @{ L = 'Skipped';     V = $s.skipped },
-        @{ L = 'Unverified';  V = $s.unverified },
-        @{ L = 'Unreadable';  V = $s.partial },
-        @{ L = 'Errors';      V = $s.errors })) {
-        [void]$sb.AppendLine('<div class="tile"><p class="label">' + $t.L + '</p><p class="value">' + $t.V + '</p></div>')
+    foreach ($spec in $script:PMTileSpec) {
+        $rows = @(Get-PMTileRows -Kind $spec.Kind -Modules $modules)
+        $n = $rows.Count
+        $cls = if ($n) { 'tile' } else { 'tile empty' }
+        [void]$sb.AppendLine('<details class="' + $cls + '"><summary><span class="label">' +
+            (ConvertTo-PMHtml $spec.Label) + '</span><span class="value">' + $n + '</span></summary>')
+        [void]$sb.AppendLine('<div class="drawer"><p class="blurb">' + (ConvertTo-PMHtml $spec.Blurb) + '</p>')
+        if ($n) {
+            [void]$sb.AppendLine('<ul class="rows">')
+            foreach ($r in $rows) {
+                $v = if ($r.V) { '<span class="rv">' + (ConvertTo-PMHtml $r.V) + '</span>' } else { '' }
+                [void]$sb.AppendLine('<li><span class="rk">' + (ConvertTo-PMHtml $r.K) + '</span>' + $v +
+                    '<span class="rd">' + (ConvertTo-PMHtml $r.D) + '</span></li>')
+            }
+            [void]$sb.AppendLine('</ul>')
+        } else {
+            [void]$sb.AppendLine('<p class="rows-empty">None this run.</p>')
+        }
+        [void]$sb.AppendLine('</div></details>')
     }
     [void]$sb.AppendLine('</div>')
 

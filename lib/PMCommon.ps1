@@ -239,6 +239,19 @@ function Get-PMReadErrorSample {
 # reddens for a benign reason trains you to ignore red, which costs more than the check gains.
 # Non-critical failures are still counted and still shown, as partial coverage.
 
+function Get-PMReadErrorMessages {
+    # Every distinct thing we could not read, capped. The count alone told a reader a number and
+    # nothing they could act on: "Unreadable: 1" is not a fact anyone can do anything with.
+    param([int]$Max = 10)
+    $seen = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($e in @($script:PMCriticalReadErrors) + @($script:PMReadErrors)) {
+        $m = [string]$e.Exception.Message
+        if ($m -and -not $seen.Contains($m)) { $seen.Add($m) }
+        if ($seen.Count -ge $Max) { break }
+    }
+    return $seen.ToArray()
+}
+
 function Add-PMReadError {
     param($Errors, [switch]$Critical)
     if (-not $Errors) { return }
