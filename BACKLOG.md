@@ -435,7 +435,7 @@ every `.ps1` under `lib\` is dot-sourced twice per run, so a permissive ACE plac
   passed by any caller, so three tuning knobs in the deletion path are only ever exercised at
   their defaults.
 
-### 6e-6k closed 2026-09-10, except 6i
+### 6e-6k closed 2026-09-10
 
 Tests 235 -> 254. What each change actually was is in the commits; this records the parts that
 are only obvious once you have been bitten.
@@ -476,11 +476,12 @@ without ever pointing a delete at a system directory.
 - **`-WhatIfOnly` stays** though no module passes it. design.md no longer claims it is
   load-bearing, which was the actual defect.
 
-**Still open: 6i** - three guarantees the README states more strongly than the code provides
-(gate 3 is opt-in via `RequiresUserSid`; `DeclaredRoots` is module-*mediated*; `Remove-PMPath`
-enforces only gate 4). All three are unreachable through the four shipped modules. Left alone
-deliberately: closing them means either tightening the code or softening the prose, and that is
-a design call rather than a defect to fix.
+**6i is closed too** - see "6i closed by tightening the code, not the prose" above. This
+paragraph used to say it was still open, describing three guarantees the README stated more
+strongly than the code provided. It was already fixed by then: `Test-PMActingUserConfirmed`
+ignores `RequiresUserSid`, `Invoke-PMModulePhase` stamps the roots, and `Remove-PMPath` enforces
+gates 1-3. Left here rather than deleted because a backlog that quietly rewrites its own history
+is worth less than one that says where it was wrong.
 
 ### 6l. The one that is a note, not a finding
 
@@ -506,3 +507,130 @@ the pattern with a looser fingerprint.
 - **A third consumer of the module framework.** It is currently shared by copy with a sibling
   project. That is fine at two and starts costing at three; if a third appears, extracting the
   engine becomes worth doing rather than premature.
+
+---
+
+## 7. Four parallel audits, 2026-09-10 (round 3)
+
+Same shape as round 2: four agents (dead code, non-operable code, leaks and performance,
+cross-cutting and security) across this repo and scripts-utilities. Every item below reproduced
+against the code. Items that did not reproduce were dropped rather than recorded.
+
+Two were fixed the same day and are struck through. The rest are recorded with the measurement
+that established them, so nobody has to re-derive it.
+
+### 7a. ~~The junction guard was added to one delete site out of three~~ DONE 2026-09-10
+
+`Test-PMPathTraversesLink` was wired into `Remove-PMPath` only. Two other recursive force-deletes
+of operator-supplied paths - `Install-PcMaintenance.ps1:98` and `Remove-PMPayloadFiles -KeepLogs`
+- called the LEXICAL half of the guard (`Test-PMPathSafe`) and never the filesystem half.
+Reproduced end to end: with the payload root junctioned at a checkout, `Test-PMPathSafe` returned
+`True`, the real `lib\` and `modules\` were destroyed, and the junction survived. Bit-for-bit
+the agent-scratchpads signature, at two sites the original fix did not reach.
+
+Both now guarded, with a regression test that was confirmed to FAIL without the fix (270 tests).
+The installer checks per item and only when the destination exists, because the guard fails
+CLOSED on a directory it cannot inspect - hoisting it above the loop would refuse every fresh
+install.
+
+**The lesson worth keeping:** the round-2 fix was correct and incomplete, and nothing detected
+the gap for a day. When a guard is added to a call site, grep for the *other* call sites of the
+dangerous operation, not for the callers of the guard.
+
+### 7b. ~~`Test-PMPathSafe` spent 40% of its time on two convenience lines~~ DONE 2026-09-10
+
+Measured over 14,000 candidates (whole function 3,834 ms): `.Where({...})` 523 ms and
+`@($segments | Select-Object -Skip 1)` 1,021 ms, against 29 ms for the `GetFullPath` doing the
+real work. Replaced with `String.Split` and an index: 34 ms. The guard runs twice per deletion,
+so a 6,935-file sweep makes 13,870 calls. All 270 tests still pass.
+
+### 7c. A test that cannot fail
+
+`tests/Invoke-Tests.ps1:1661` - *"NewestUtc finds the deepest-written file, and equals
+Get-PMNewestWriteUtc"*. The second conjunct cannot fail independently of the first:
+`Get-PMNewestWriteUtc` is a two-line wrapper that calls the same `Get-PMTreeStat` the first
+conjunct calls, and `Resolve-PMTreeAge` returns `$Stat.NewestUtc` verbatim for the tree the
+fixture builds. The name promises agreement between two implementations; there is one.
+
+### 7d. `Get-PMNewestWriteUtc` is dead in production
+
+Zero production call sites; all 8 are in the test suite. Superseded by the fused
+`Get-PMTreeStat` + `Resolve-PMTreeAge` under item 6d, and `agent-scratchpads/module.ps1:59` still
+carries the comment "This used to call Get-PMNewestWriteUtc". It is now a test helper living in
+shipped code that SYSTEM dot-sources. Interlocks with 7c: fixing that test removes the main
+argument for keeping it. Either delete it and rewrite the 8 call sites against the two functions
+it wraps, or move it into the test file.
+
+### 7e. `$RequiresUserSid` is mandatory, unused, and its docstring explains why it is kept
+
+`lib/PMManifest.ps1:63-72`. `Test-PMActingUserConfirmed` takes it `[Parameter(Mandatory)]` and
+the entire body is `return $LoggedIn`. The docstring says it is "still taken so the reason can be
+reported accurately" - but the only production caller sets a fixed `$holdBack` string that never
+mentions it. The stated justification is not realised anywhere. Tests pin both values, so this is
+a deliberate decision to re-take, not an oversight to patch.
+
+### 7f. Two tests report PASS where they mean SKIP
+
+`tests/Invoke-Tests.ps1:525-530` returns `$true` when its precondition is absent, counting as a
+pass. The same file uses `return 'SKIP'` for the identical situation at `:2216`, and the `It`
+docstring says *"a check that quietly reports success while doing nothing is the exact failure
+this suite exists to catch, and the suite must not commit it itself."* Same shape at
+`tests/Invoke-DeploymentSmoke.ps1:118-119`, where `catch { return $true }` passes "a real write
+into lib\ is refused" on *any* exception, including a missing `lib\`.
+
+### 7g. Two tests assert the fail-open cast the production code was rewritten to avoid
+
+`tests/Invoke-Tests.ps1:162` and `:834` use `[bool](Import-PMModuleInfo ...)['AutoApply']`, which
+is exactly what `Test-PMApplyAllowed` (`PMManifest.ps1:166-175`) was changed to stop doing. If a
+psd1 ever said `AutoApply = 'false'`, `[bool]'false'` is `$true`: the test stays green while the
+module has silently become report-only.
+
+### 7h. An all-locked repair renders a green "Cleaned" badge
+
+`modules/*/module.ps1` set `Ok = ($vetoed -eq 0)`. A Repair in which every delete was **locked**
+rather than vetoed therefore returns `Ok = $true` -> status `applied` -> a green "Cleaned" badge
+-> `summary.applied++` -> exit 0. Only the Detail string ("removed 0 of 940; 0 vetoed, 940
+locked") is honest, and the comment directly above says *"Ok reflects what actually happened."*
+Not demonstrated - exercising it needs `-Apply`, which the audit was not permitted to run - so
+confirm before changing.
+
+### 7i. Dead manifest keys, ~100 lines of them
+
+`Import-PMModuleInfo` reads only `Id, Name, Category, Entry, Roots`. Every `module.psd1` also
+defines `Version`, `Description` and `Details` - the last being a here-string of roughly 25 lines
+per module - and none of the three is read by any `.ps1`. `Description` and `Details` appear only
+in test fixtures. Either render them in the report (they are good prose and the report has no
+per-module explanation) or delete them; carrying documentation that nothing displays is the
+worst of both.
+
+### 7j. `$KnownSizes` is inert in `plex-bif-orphans`
+
+Declared on `Get-PlexOrphanCandidates` (`:30`), zero body references - it uses `$f.Length`
+directly. The other three modules all use it, and this module's own callers are inconsistent
+(`:87` passes it, `:57` does not). Defensible as a uniform module contract; genuinely inert here
+because Plex candidates are files rather than trees. Decide which.
+
+### 7k. Optimization, measured
+
+Timed under 5.1, the version the scheduled task runs.
+
+| Where | Measured | Fix |
+|---|---|---|
+| `plex-bif-orphans/module.ps1:44-46` | 4,723 ms / **+248.2 MB** on a real 59,820-file tree | one streaming `Stack` + `EnumerateFiles` walk: 2,298 ms / +29.8 MB - **2x time, 8.3x memory**, identical results |
+| `stale-app-temp:18` + `vs-installer-scratch:10` | 565 ms x 4 = **2.26 s** per apply run | both resolve to the SAME Temp directory and each enumerates it in Test *and* Repair; cache the listing on `$Context` (re-deriving between phases is deliberate, the duplication between modules is not) |
+| `PMCommon.ps1:471, 484` | 565 ms vs 88 ms | `DirectoryInfo.EnumerateDirectories()` instead of `Get-ChildItem` - **6.4x**, keeping the `-ErrorVariable` accounting via try/catch |
+| `stale-app-temp/module.ps1:33` | 1,209 ms vs 69 ms over 11,599 names | `foreach` + `break` instead of a `Where-Object` pipeline per directory - **17x**, and this module's own comment calls it "the copy the next module gets cloned from" |
+| `PMModule.ps1:43` | 27-55 ms x 8 phases | re-dot-sources all of `lib\` per phase; scope isolation is the point, low priority |
+
+**Clean, and worth recording so nobody re-checks:** no undisposed resources in this repo - the
+lock stream is disposed on all three exit paths, the one hand-rolled enumerator has a correct
+try/finally, and there are no `Register-ObjectEvent`, runspaces, jobs or CIM sessions anywhere.
+`+=` appears only over bounded collections. The 200-cap read-error accumulator is correct by
+design. The deployed payload hash-matches the repo exactly.
+
+### 7l. The one that is a note, not a finding
+
+The 8.3 short-name handling in `Remove-PMPath` was independently re-verified under 5.1 and its
+unusual comments are true: `DirectoryInfo('C:\PROGRA~1').FullName` expands, while
+`[IO.Path]::GetFullPath('C:\PROGRA~1\x')` does not and `...\__nope__` does. The inconsistency
+the fix exists for is real.

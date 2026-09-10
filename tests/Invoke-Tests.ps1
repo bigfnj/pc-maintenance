@@ -2264,6 +2264,51 @@ It 'and the target itself is still measured normally when asked directly' {
     } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== the uninstaller must not delete THROUGH a junctioned payload root ==" -ForegroundColor Cyan
+# An audit found that Test-PMPathTraversesLink had been added to Remove-PMPath only, while two
+# other recursive force-deletes of operator-supplied paths - this one and the installer's
+# redeploy - still called the LEXICAL half of the guard alone. Reproduced before fixing: with
+# the payload root junctioned at a checkout, the real lib\ and modules\ were destroyed and the
+# junction survived. Same signature as the agent-scratchpads bug, two call sites the fix missed.
+It 'Remove-PMPayloadFiles -KeepLogs refuses a root reached through a junction, and the target survives' {
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-jx-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'; $link = Join-Path $base 'link'
+    New-Item -ItemType Directory -Path (Join-Path $real 'lib') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $real 'modules') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $real 'logs') -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $real 'lib\PMCommon.ps1') -Value '# real source' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $real 'Invoke-PcMaintenance.ps1') -Value '# real entry' -Encoding UTF8
+        $null = cmd /c mklink /J "`"$link`"" "`"$real`"" 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { return 'SKIP' }   # junctions unavailable
+
+        $res = Remove-PMPayloadFiles -Root $link -KeepLogs
+
+        # Blocked, nothing removed, and - the part that actually matters - the real tree behind
+        # the link is intact. Asserting only Blocked would pass even if the delete had run first.
+        $res.Blocked -and (-not $res.Removed) -and
+        (Test-Path -LiteralPath (Join-Path $real 'lib\PMCommon.ps1')) -and
+        (Test-Path -LiteralPath (Join-Path $real 'Invoke-PcMaintenance.ps1')) -and
+        (Test-Path -LiteralPath $link)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'but an ordinary payload root is still removed, so the guard did not just disable the feature' {
+    # The companion every refusal test needs. A guard that refuses everything passes the test
+    # above and breaks uninstall entirely.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-jx2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $root = Join-Path $base 'PcMaintenance'
+    New-Item -ItemType Directory -Path (Join-Path $root 'lib') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $root 'logs') -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $root 'lib\PMCommon.ps1') -Value '# x' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Value '# x' -Encoding UTF8
+        $res = Remove-PMPayloadFiles -Root $root -KeepLogs
+        (-not $res.Blocked) -and $res.Removed -and $res.KeptLogs -and
+        (-not (Test-Path -LiteralPath (Join-Path $root 'lib'))) -and
+        (Test-Path -LiteralPath (Join-Path $root 'logs'))
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Write-Host "`n== capping retained read errors must not cap the COUNT ==" -ForegroundColor Cyan
 # The accumulator keeps at most 200 ErrorRecords now, because it used to keep every one in an
 # array grown with += - O(n^2), and 1-3 KB of Exception/InvocationInfo apiece. The danger in

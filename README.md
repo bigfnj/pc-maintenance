@@ -190,7 +190,8 @@ Open work and the order I would do it in: [BACKLOG.md](BACKLOG.md).
 Invoke-PcMaintenance.ps1       dispatcher (report-only unless -Apply)
 Install-/Uninstall-*.ps1       ProgramData payload + SYSTEM task register/remove
 task_template.xml              weekly SYSTEM task, no policy triggers
-pcmaintenance.manifest.json    modules, order, allowedCategories, task shape, retention
+pcmaintenance.manifest.json    modules, order, allowedCategories, retention - never
+                               the schedule; a task block here silently does nothing
 lib/PMCommon.ps1               logging, user resolution, filesystem readers, THE PATH GUARD,
                                and the payload-ACL check the installer must satisfy
 lib/PMManifest.ps1             manifest load + the category and apply gates

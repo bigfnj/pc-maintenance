@@ -79,6 +79,21 @@ foreach ($i in $items) {
     $src = Join-Path $SourceRoot $i
     $dst = Join-Path $PayloadRoot $i
     if (-not (Test-Path -LiteralPath $src)) { Write-PMLog "missing source: $i" 'ERROR'; exit 1 }
+    # Test-PMPathSafe above compares STRINGS, and a string cannot reveal that $PayloadRoot is a
+    # junction. Remove-Item -Recurse follows a link that is an ANCESTOR of its target - it only
+    # declines to descend one it finds INSIDE the tree - so a junctioned payload root sends the
+    # delete below straight through to the real lib\ and modules\, destroying them and leaving
+    # the junction behind. That is the same HIGH-severity fault found and fixed in
+    # agent-scratchpads; this site and the uninstaller's -KeepLogs were still calling only the
+    # lexical half of the guard. Reproduced end to end before adding this.
+    #
+    # Guarded per item and only when $dst exists, because the check fails CLOSED on a directory
+    # it cannot inspect: hoisting it above the loop would refuse every fresh install, where
+    # $PayloadRoot legitimately does not exist yet.
+    if ((Test-Path -LiteralPath $dst) -and (Test-PMPathTraversesLink -Path $dst -Root $guardRoot)) {
+        Write-PMLog "refusing to deploy $i - '$dst' is reached through a junction or symlink, so removing it would delete the link target" 'ERROR'
+        exit 1
+    }
     # Both were unchecked, with $ErrorActionPreference at its default Continue. A held-open file
     # under lib\ made Remove-Item fail non-terminating, and Copy-Item -Recurse then nested the
     # new library at lib\lib\ leaving the OLD lib\*.ps1 in place - after which this script
