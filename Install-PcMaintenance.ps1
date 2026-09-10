@@ -15,9 +15,11 @@
     Downloads.
 
     The registered task passes -Apply. That is not the same as "delete everything": -Apply only
-    unlocks modules whose own manifest declares AutoApply, which today is the two with a
-    mechanical rule and ~100% recurrence. Everything else keeps reporting. Both gates are what
-    make an unattended weekly run reasonable at all.
+    unlocks modules whose own manifest declares AutoApply, and each of those had to earn it with
+    a mechanical rule and a measured recurrence. Everything else keeps reporting. Both gates are
+    what make an unattended weekly run reasonable at all. (This paragraph used to name a count,
+    which was stale the day a third module was enabled; the suite pins the count, so this does
+    not need to.)
 
     Elevation is needed only to REGISTER a SYSTEM task; the task itself then runs as SYSTEM.
 
