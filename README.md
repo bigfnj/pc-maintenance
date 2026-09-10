@@ -117,6 +117,25 @@ unreadable spots (a locked temp directory, a file that vanished mid-scan) are co
 as *partial coverage* and do not redden the run, because a control that goes red for a benign
 reason is one you learn to ignore.
 
+**"Cleaned" means finished.** A repair has three outcomes, not two, and which one it gets is
+decided by the dispatcher from the counters the module returns — never from a verdict the module
+supplies about its own run, for the same reason the declared roots are the dispatcher's.
+
+| outcome | when | badge | exit |
+|---|---|---|---|
+| `applied` | everything it set out to remove is gone | green **Cleaned** | 0 |
+| `incomplete` | some went, something is still locked | amber **Not fully cleaned** | 0 |
+| `error` | it removed nothing it meant to, *or* the path guard vetoed anything at all | red **Error** | 1 |
+
+A veto is a hard failure however much else succeeded: the guard refusing a target means a module
+asked to delete something it may not touch, and that is never routine. A locked file is the
+opposite — one open handle among 940 items is ordinary weather on a machine in use, so it goes
+amber and the weekly task stays green. This replaced `Ok = ($vetoed -eq 0)`, which asked "did the
+guard refuse anything?" while everything downstream read the answer as "did the cleanup work?":
+a repair in which all 940 deletes were *locked* rendered a green **Cleaned** badge over 0 bytes
+freed and exited 0. Bytes are recorded whatever the outcome, because a directory delete that
+fails part-way still frees what it got through and the run log is what stands in for a backup.
+
 ## The report
 
 Every run writes `logs/run-<id>.json` plus a self-contained HTML dashboard named

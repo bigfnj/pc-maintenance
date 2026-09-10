@@ -97,7 +97,11 @@ if ($insecure.Count) {
 }
 
 $results = @()
-$summary = [ordered]@{ total = 0; clean = 0; found = 0; applied = 0; skipped = 0; unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
+# 'incomplete', not 'partial': summary.partial already exists here and means something else
+# entirely - the number of locations that could not be READ. Reusing the word would have put
+# two unrelated quantities under one name in a log format kept 50 runs deep and diffed week
+# to week. See Get-PMRepairOutcome.
+$summary = [ordered]@{ total = 0; clean = 0; found = 0; applied = 0; incomplete = 0; skipped = 0; unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
 
 $fatal = $null
 try {
@@ -273,15 +277,63 @@ try {
 
             $rw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Repair -Context $ctx -LibDir $libDir -Entry $info.Entry
             $r = $rw.Result
-            $row.status = if ($r.Ok) { 'applied' } else { 'error' }
+
+            # The same shape check Test gets above, and for a sharper reason. A Repair result
+            # that is missing its counters would read as 0 attempted / 0 removed, which
+            # Get-PMRepairOutcome quite correctly calls 'applied' - nothing to do, nothing left
+            # undone. A module that answered NOTHING would therefore have gone green. Absence
+            # of an answer is the strongest refusal available, never consent.
+            $missing = @()
+            if ($null -ne $r -and -not ($r -is [array])) {
+                foreach ($fld in 'Attempted', 'Removed', 'Vetoed', 'Locked', 'Gone') {
+                    if ($null -eq $r.PSObject.Properties[$fld]) { $missing += $fld }
+                }
+            }
+            if ($null -eq $r -or $r -is [array] -or $missing.Count) {
+                $shape = if ($null -eq $r) { 'nothing' }
+                         elseif ($r -is [array]) { "$(@($r).Count) objects" }
+                         else { "no $($missing -join '/')" }
+                $row.status = 'error'
+                $row.detail = "Repair returned $shape; a module must return one result object carrying its counters"
+                Write-PMLog "$modId ERROR - $($row.detail)" 'ERROR'
+                $summary.errors++; $results += $row; continue
+            }
+
+            # Decided HERE, from the numbers, with the function the module used to build its own
+            # Detail line - not from a boolean the module handed back. This used to be
+            # `if ($r.Ok) { 'applied' } else { 'error' }` over a module-supplied Ok that meant
+            # only "the guard did not veto", so a repair in which all 940 deletes were LOCKED
+            # went green and exited 0 (BACKLOG 7h). Same argument as the declared roots: a
+            # module's verdict on its own run is self-certification.
+            $outcome = Get-PMRepairOutcome -Attempted ([int]$r.Attempted) -Removed ([int]$r.Removed) `
+                                           -Vetoed ([int]$r.Vetoed) -Locked ([int]$r.Locked) -Gone ([int]$r.Gone)
+            $row.status = $outcome.Status
             $row.detail = [string]$r.Detail
             $row.bytes  = if ($null -ne $r.Bytes) { [int64]$r.Bytes } else { [int64]0 }
-            if ($r.Ok) {
-                $summary.applied++; $summary.bytes += $row.bytes
+            # The counters in machine-readable form, beside the sentence. They now decide the
+            # process exit code, and a number that decides something belongs in the record
+            # rather than only in prose a diff cannot compare.
+            $row.repair = [ordered]@{ attempted = [int]$r.Attempted; removed = [int]$r.Removed
+                                      vetoed = [int]$r.Vetoed; locked = [int]$r.Locked; gone = [int]$r.Gone }
+
+            # Credited whatever the outcome, including 'error'. Those bytes are off the disk
+            # either way and this record is what stands in for a backup, so a repair that
+            # failed after destroying 6,000 B must not report 0 - the same mistake the modules
+            # were making one level down. Only 'applied' used to add here, which is how a
+            # partial delete inside a failed repair became invisible twice over.
+            $summary.bytes += $row.bytes
+
+            if ($outcome.Status -eq 'applied') {
+                $summary.applied++
                 Write-PMLog ("{0} removed {1} - {2}" -f $modId, (Format-PMBytes $row.bytes), $r.Detail) 'CHANGE'
+            } elseif ($outcome.Status -eq 'incomplete') {
+                # CHANGE is the honest level: state really was altered. What must not happen is
+                # that it reads as success, which is what the word in the message is for.
+                $summary.incomplete++
+                Write-PMLog ("{0} removed {1} but did NOT finish - {2}" -f $modId, (Format-PMBytes $row.bytes), $r.Detail) 'CHANGE'
             } else {
                 $summary.errors++
-                Write-PMLog "$modId FAILED - $($r.Detail)" 'ERROR'
+                Write-PMLog ("{0} FAILED after freeing {1} - {2}" -f $modId, (Format-PMBytes $row.bytes), $r.Detail) 'ERROR'
             }
         } catch {
             $row.status = 'error'; $row.detail = $_.Exception.Message
@@ -299,6 +351,12 @@ try {
 } finally {
     # unverified is a real failure of the sweep's purpose, so it earns a non-zero exit too:
     # a weekly job that cannot see must not report success.
+    #
+    # summary.incomplete is deliberately NOT here. One locked file among 940 is the normal
+    # weather on a machine that is being used, and a control that goes red every week for a
+    # benign reason is one you learn to ignore - the same judgement already made for partial
+    # READ coverage a few lines up. Amber says so on the report and in the transcript; only a
+    # repair that achieved NOTHING (or that the guard refused) reddens the task.
     $exitCode = if ($fatal -or $summary.errors -gt 0 -or $summary.unverified -gt 0) { 1 } else { 0 }
     $runObj = [ordered]@{
         runId = $runId; startedUtc = $startedUtc; finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
@@ -346,9 +404,10 @@ try {
         }
     }
 
-    Write-PMLog ('=== SUMMARY total={0} clean={1} found={2} applied={3} skipped={4} unverified={5} errors={6} freed={7} (exit {8}) ===' -f `
-            $summary.total, $summary.clean, $summary.found, $summary.applied, $summary.skipped,
-            $summary.unverified, $summary.errors, (Format-PMBytes $summary.bytes), $exitCode) $(if ($exitCode) { 'ERROR' } else { 'OK' })
+    Write-PMLog ('=== SUMMARY total={0} clean={1} found={2} applied={3} incomplete={4} skipped={5} unverified={6} errors={7} freed={8} (exit {9}) ===' -f `
+            $summary.total, $summary.clean, $summary.found, $summary.applied, $summary.incomplete,
+            $summary.skipped, $summary.unverified, $summary.errors, (Format-PMBytes $summary.bytes),
+            $exitCode) $(if ($exitCode) { 'ERROR' } else { 'OK' })
 
     try {
         $maxRuns = 50; $maxAge = 30   # only used if the manifest omits logRetention

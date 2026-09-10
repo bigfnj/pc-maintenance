@@ -114,6 +114,12 @@ function Get-PMStatusPresentation {
         'clean'    { @{ Role = 'good';     Icon = 'OK';   Word = 'Clean' } }
         'reported' { @{ Role = 'warning';  Icon = '!';    Word = 'Found' } }
         'applied'  { @{ Role = 'good';     Icon = 'OK';   Word = 'Cleaned' } }
+        # Amber, and it says so in words as well. Until BACKLOG 7h this status did not exist
+        # and a repair that deleted some of what it found - or none of it - wore the same green
+        # "Cleaned" badge as one that finished, because the dispatcher only had two outcomes to
+        # map. 'Not fully cleaned' rather than anything built on "partial": that word already
+        # means unreadable-location coverage everywhere else in this report.
+        'incomplete' { @{ Role = 'warning'; Icon = '!';  Word = 'Not fully cleaned' } }
         'skipped'  { @{ Role = 'muted';    Icon = '--';   Word = 'Skipped' } }
         'unverified' { @{ Role = 'serious'; Icon = '/!'; Word = 'Could not check' } }
         'error'    { @{ Role = 'critical'; Icon = 'X';    Word = 'Error' } }
@@ -141,6 +147,7 @@ function Get-PMTileRows {
             'clean'      { if ($m.status -eq 'clean')      { $rows += @{ K = $m.id; V = 'nothing to do'; D = [string]$m.detail } } }
             'found'      { if ($m.status -eq 'reported')   { $rows += @{ K = $m.id; V = (Format-PMBytes $bytes); D = [string]$m.detail } } }
             'applied'    { if ($m.status -eq 'applied')    { $rows += @{ K = $m.id; V = (Format-PMBytes $bytes) + ' freed'; D = [string]$m.detail } } }
+            'incomplete' { if ($m.status -eq 'incomplete') { $rows += @{ K = $m.id; V = (Format-PMBytes $bytes) + ' freed'; D = [string]$m.detail } } }
             'skipped'    { if ($m.status -eq 'skipped')    { $rows += @{ K = $m.id; V = 'not run'; D = [string]$m.detail } } }
             'unverified' { if ($m.status -eq 'unverified') { $rows += @{ K = $m.id; V = 'could not check'; D = [string]$m.detail } } }
             'errors'     { if ($m.status -eq 'error')      { $rows += @{ K = $m.id; V = 'failed'; D = [string]$m.detail } } }
@@ -164,14 +171,21 @@ $script:PMTileSpec = @(
     # the two next to 'Cleaned up', and summary.found is a published field in a log format
     # that is retained 50 runs deep and diffed week to week.
     @{ Kind = 'found';      Label = 'Left alone';     Blurb = 'Found something and left it where it was, because this run or this module is not allowed to act. The run JSON counts these plus anything cleaned up in its own summary.found.' }
-    @{ Kind = 'applied';    Label = 'Cleaned up';     Blurb = 'Actually deleted something.' }
+    @{ Kind = 'applied';    Label = 'Cleaned up';     Blurb = 'Actually deleted everything it set out to delete.' }
+    # A status with no tile appears only inside "Modules run", where you have to notice a badge
+    # to know anything happened - so every status the dispatcher can write gets one. The bytes
+    # shown here are real: a directory delete that fails part-way still frees what it got
+    # through, and the run JSON counts those bytes in summary.bytes like any other.
+    @{ Kind = 'incomplete'; Label = 'Not fully cleaned'
+       Blurb = 'Deleted some of what it found and could not finish - almost always a file still open in another process. The run does NOT fail for this: a control that goes red every week for a benign reason is one you learn to ignore. The run JSON counts these in summary.incomplete.' }
     @{ Kind = 'skipped';    Label = 'Skipped';        Blurb = 'Did not run at all: the category is not permitted, or it needs a logged-on user and there was none.' }
     @{ Kind = 'unverified'; Label = 'Could not check'; Blurb = 'Could not read the place it is responsible for, so "clean" would have been a guess. This is why the run reports failure.' }
     # Same shape of mismatch, smaller: this lists DISTINCT messages, capped at ten, while
     # summary.partial is the total number of failed reads. Ten rows under a JSON figure of
     # 4,000 is correct and looks wrong unless the blurb says so.
     @{ Kind = 'partial';    Label = "Couldn't read";  Blurb = 'Individual spots that were locked or access-denied while scanning. The rest of the sweep is still valid; these are simply not covered. Shown as distinct messages, at most ten; the run JSON reports the full count in summary.partial.' }
-    @{ Kind = 'errors';     Label = 'Errors';         Blurb = 'A module threw, or its removal was refused by the path guard.' }
+    @{ Kind = 'errors';     Label = 'Errors'
+       Blurb = 'A module threw, its removal was refused by the path guard, or it found things to delete and removed none of them. Along with "Could not check", this is what makes the weekly run report failure.' }
 )
 
 $script:PMReportCss = @'

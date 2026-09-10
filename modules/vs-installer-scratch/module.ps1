@@ -124,7 +124,17 @@ function Repair-PMModule {
         # gets measured normally.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
-        if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
+        # Credited BEFORE the success test, and outside it. Remove-Item -Recurse can delete most
+        # of a tree and then throw, and Remove-PMPath re-measures precisely so it can report
+        # what it did free - "the one thing the audit trail must never get wrong", says the
+        # comment there. All four modules then discarded that number, because this guard only
+        # credited a full success: a partial delete recorded 0 B in the record that stands in
+        # for a backup. Measured on 2026-09-10 with one locked file: 6,000 of 6,050 B really
+        # gone, logged as nothing. This module is the likeliest to hit it - a VS extraction is
+        # thousands of files and the installer can still hold one. Bytes is 0 on every other
+        # outcome, so this is unconditional.
+        $freed += [int64]$r.Bytes
+        if ($r.Removed) { $removed++; continue }
         # One shared mapping in PMCommon, not a copy per module. The copies drifted: three of
         # the four never gained an arm for 'no declared roots supplied', so a guard refusal was
         # counted as 'locked' and Ok = ($vetoed -eq 0) stayed TRUE.
@@ -134,13 +144,20 @@ function Repair-PMModule {
             default  { $locked++ }
         }
     }
-    # Ok reflects what actually happened. Returning $true unconditionally meant a run in which the
-    # guard refused every single target still rendered a green "Cleaned" badge.
-    $ok = ($vetoed -eq 0)
+    # Counters, not a verdict. Ok = ($vetoed -eq 0) used to travel from here, and it answered
+    # "did the guard refuse anything?" while the dispatcher read it as "did the cleanup work?" -
+    # BACKLOG 7h. The dispatcher now decides from these numbers with the same shared function,
+    # for the reason the declared roots are its and not the module's: a module's own verdict on
+    # its own run is self-certification.
+    $outcome = Get-PMRepairOutcome -Attempted @($items).Count -Removed $removed `
+                                   -Vetoed $vetoed -Locked $locked -Gone $gone
     [pscustomobject]@{
-        Ok     = $ok
-        Bytes  = $freed
-        Detail = ('removed {0} of {1}; {2} vetoed by the path guard, {3} locked, {4} already gone' -f
-                    $removed, @($items).Count, $vetoed, $locked, $gone)
+        Attempted = @($items).Count
+        Removed   = $removed
+        Vetoed    = $vetoed
+        Locked    = $locked
+        Gone      = $gone
+        Bytes     = $freed
+        Detail    = $outcome.Detail
     }
 }

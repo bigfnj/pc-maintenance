@@ -1056,10 +1056,14 @@ function Get-PMRemovalBucket {
 
         Here rather than copied into each module because the copies DRIFTED. Three of the four
         shipped modules never gained an arm for 'no declared roots supplied', so that refusal
-        fell through to their default bucket - locked - and since Ok is computed as
+        fell through to their default bucket - locked - and because Ok was then computed as
         ($vetoed -eq 0), a run in which the guard refused every single target would still have
         returned Ok = $true and rendered a green "Cleaned" badge. That is the exact failure the
         comment above each of those switches claims was already fixed.
+
+        That Ok expression is gone; see Get-PMRepairOutcome below, which is where the buckets
+        this function returns are turned into an outcome. Mis-bucketing still matters just as
+        much, because 'vetoed' is the arm that fails a run outright.
 
         Unreachable today only because the dispatcher pre-empts a module with no resolvable
         declared roots before Repair ever runs. "Unreachable by one caller's current control
@@ -1073,6 +1077,61 @@ function Get-PMRemovalBucket {
         '*declared*' { return 'vetoed' }
         'gone'       { return 'gone' }
         default      { return 'locked' }
+    }
+}
+
+function Get-PMRepairOutcome {
+    <#
+        Did a Repair achieve what it set out to do? Returns the status the dispatcher records
+        ('applied', 'incomplete' or 'error') and the one sentence that describes the same
+        numbers, so the badge and the prose beside it can never disagree.
+
+        This replaces Ok = ($vetoed -eq 0), which asked a much narrower question - "did the
+        path guard refuse anything?" - while everything downstream read the answer as "did the
+        cleanup work?". BACKLOG 7h, reproduced end to end on 2026-09-10 with one exclusively
+        locked file: Remove-PMPath returned Removed=$false / "partially removed then failed:
+        IOException", Get-PMRemovalBucket correctly called it 'locked', $vetoed stayed 0, and
+        so a repair that freed nothing rendered Role 'good' / Icon 'OK' / Word 'Cleaned',
+        counted itself in summary.applied and exited 0. Only the Detail string was honest.
+
+        Here rather than copied into each module for the reason recorded on Get-PMRemovalBucket
+        immediately above: the four copies of that Ok expression - and the four verbatim copies
+        of the Detail format string below - are exactly what drifted last time.
+
+        THE RULES, and why each is where it is:
+
+          - vetoed > 0 is ALWAYS a hard failure, whatever else succeeded. The guard refusing a
+            target means a module asked to delete something it may not touch; that is never
+            routine, and averaging it away against 939 successes is how it would be ignored.
+          - removed == attempted - gone is success. Something that vanished between Test and
+            Repair is not work left undone - the tree is in the state the run wanted.
+          - removed > 0 with anything still locked is 'incomplete': real work happened, and it
+            did not finish. Green would over-claim it, red would cry wolf.
+          - removed == 0 while there was genuinely something to remove is 'error'. This is the
+            case the whole item is about.
+
+        -ge rather than -eq on the success test is deliberate. If a module ever hands back
+        counters that do not add up, over-counting removals must not fall through to the
+        'incomplete' arm and read as a partial success; the caller-side shape check in the
+        dispatcher is what catches an inconsistent module.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$Attempted,
+        [Parameter(Mandatory)][int]$Removed,
+        [Parameter(Mandatory)][int]$Vetoed,
+        [Parameter(Mandatory)][int]$Locked,
+        [Parameter(Mandatory)][int]$Gone
+    )
+    $expected = $Attempted - $Gone
+    $status =
+        if ($Vetoed -gt 0)              { 'error' }
+        elseif ($Removed -ge $expected) { 'applied' }
+        elseif ($Removed -gt 0)         { 'incomplete' }
+        else                            { 'error' }
+    [pscustomobject]@{
+        Status = $status
+        Detail = ('removed {0} of {1}; {2} vetoed by the path guard, {3} locked, {4} already gone' -f
+                    $Removed, $Attempted, $Vetoed, $Locked, $Gone)
     }
 }
 

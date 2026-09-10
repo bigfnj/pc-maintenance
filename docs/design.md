@@ -87,6 +87,44 @@ carry a `-Critical` flag. Critical means the module's own root, where failure in
 answer. Everything else is *partial coverage*: counted, displayed, and not a failure. Every shipped
 module marks its load-bearing read `-Critical`, pinned by a test, because that is cheap to forget.
 
+### Cleaned is not the same claim as "the guard did not veto"
+
+The sibling project's module contract returns `Ok`, and a preference repair there really is
+binary: the key holds the value or it does not. Deletion is not. This project inherited the
+boolean, each module computed it as `Ok = ($vetoed -eq 0)`, and the dispatcher mapped it with
+`if ($r.Ok) { 'applied' } else { 'error' }`.
+
+Every hop in that chain was individually defensible and the composition was wrong. `Remove-PMPath`
+returns `Removed = $false` with `Reason = "partially removed then failed: IOException"` when
+`Remove-Item -Recurse` deletes most of a tree and throws; `Get-PMRemovalBucket` correctly calls
+that **locked**; locked is not vetoed, so `Ok` stayed `$true`. Reproduced end to end on
+2026-09-10 by holding one exclusive `FileStream`: status `applied`, badge `Role 'good' / Icon
+'OK' / Word 'Cleaned'`, `summary.applied = 1`, `summary.bytes = 0`, exit 0. Only the Detail
+string — *"removed 0 of 1; 0 vetoed by the path guard, 1 locked, 0 already gone"* — was honest.
+
+`Get-PMRepairOutcome` now decides, from counters rather than a boolean, and it lives in
+`PMCommon` beside `Get-PMRemovalBucket` for the reason recorded there: four copies of this
+expression is what drifted last time. **The dispatcher calls it, not the module's answer to it.**
+A module's verdict on its own run is self-certification, exactly like a module supplying its own
+roots — the modules return what happened (attempted, removed, vetoed, locked, gone) and the
+dispatcher decides what that means, then writes both the decision and the counters to the run
+JSON. A Repair result missing those counters is an error, because 0 attempted / 0 removed is
+legitimately "applied" and a module that answered nothing would otherwise have gone green.
+
+The exit-code split is the part worth arguing about. A veto fails the run outright however much
+else succeeded, because the guard refusing a target means a module asked for something it may not
+have. A *locked* file does not: one open handle among 940 items is ordinary on a machine in use,
+and a job that goes red every Sunday for a benign reason stops being read — the same judgement
+already made for partial read coverage, one section up. So `incomplete` is amber and exits 0, and
+only a repair that achieved nothing reddens the task.
+
+The second defect lived in the same four lines. `Remove-PMPath` re-measures after a throw and
+returns the bytes it *did* free, with a comment calling that "the one thing the audit trail must
+never get wrong" — and all four modules discarded it, because the credit sat inside
+`if ($r.Removed)`. So did the dispatcher, which only added to `summary.bytes` on success. Measured
+on the same fixture: 6,000 of 6,050 bytes really gone, recorded as zero, twice over. There is no
+backup here; the log is the whole record of what a run destroyed.
+
 ### The audit trail replaces the backup
 
 Nothing can snapshot tens of gigabytes of scratch, so every run records the paths considered with

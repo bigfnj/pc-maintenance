@@ -300,7 +300,7 @@ function Test-PMModule {
     # Claims clean while blind - exactly the bug this guard exists for.
     [pscustomobject]@{ Clean = $true; Detail = 'looks clean to me'; Bytes = [int64]0; Items = @() }
 }
-function Repair-PMModule { param($Context) [pscustomobject]@{ Changed=$false; Ok=$true; Bytes=[int64]0; Detail='' } }
+function Repair-PMModule { param($Context) [pscustomobject]@{ Attempted=0; Removed=0; Vetoed=0; Locked=0; Gone=0; Bytes=[int64]0; Detail='' } }
 '@ | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
     '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"blindmod","enabled":true,"order":10}] }' |
         Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
@@ -345,7 +345,8 @@ function New-PMGateFixture {
         'function Repair-PMModule {'
         '    param($Context)'
         "    Set-Content -LiteralPath '$marker' -Value 'yes' -Encoding UTF8"
-        "    [pscustomobject]@{ Ok = `$true; Bytes = [int64]0; Detail = 'fixture' }"
+        "    [pscustomobject]@{ Attempted = 0; Removed = 0; Vetoed = 0; Locked = 0; Gone = 0"
+        "                       Bytes = [int64]0; Detail = 'fixture' }"
         '}'
     )
     $body | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
@@ -395,7 +396,7 @@ It 'the PROCESS exit code reports failure, not just the JSON field' {
         "    try { Get-ChildItem -LiteralPath 'C:\__nope__\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors `$_ -Critical }"
         "    [pscustomobject]@{ Clean = `$true; Detail = 'looks clean'; Bytes = [int64]0; Items = @() }"
         '}'
-        'function Repair-PMModule { param($Context) [pscustomobject]@{ Ok = $true; Bytes = [int64]0; Detail = @() } }'
+        'function Repair-PMModule { param($Context) [pscustomobject]@{ Attempted=0; Removed=0; Vetoed=0; Locked=0; Gone=0; Bytes = [int64]0; Detail = @() } }'
     ) | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
     '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"blind2","enabled":true,"order":10}] }' |
         Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
@@ -637,7 +638,7 @@ It 'a module leaking extra output does not silently rewrite its Count' {
         "    'stray output that should not be here'"
         "    [pscustomobject]@{ Clean = `$false; Count = 940; Detail = 'many'; Bytes = [int64]1; Items = @() }"
         '}'
-        'function Repair-PMModule { param($Context) [pscustomobject]@{ Ok = $true; Bytes = [int64]0; Detail = "" } }'
+        'function Repair-PMModule { param($Context) [pscustomobject]@{ Attempted=0; Removed=0; Vetoed=0; Locked=0; Gone=0; Bytes = [int64]0; Detail = "" } }'
     ) | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
     '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"noisy","enabled":true,"order":10}] }' |
         Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
@@ -1861,7 +1862,7 @@ function Test-PMModule {
         Sizes = (ConvertTo-PMSizeMap -Items $items)
     }
 }
-function Repair-PMModule { param($Context) [pscustomobject]@{ Ok=$true; Bytes=[int64]0; Detail='' } }
+function Repair-PMModule { param($Context) [pscustomobject]@{ Attempted=0; Removed=0; Vetoed=0; Locked=0; Gone=0; Bytes=[int64]0; Detail='' } }
 '@ | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
     '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"sizemod","enabled":true,"order":10}] }' |
         Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
@@ -1928,9 +1929,11 @@ function Repair-PMModule {
     `$freed = [int64]0; `$removed = 0; `$vetoed = 0
     foreach (`$i in `$items) {
         `$r = Remove-PMPath -Path `$i.Path -Roots @(`$script:DataRoot) -DeclaredRoots @(`$Context.DeclaredRoots) -KnownBytes ([int64]`$i.Bytes)
-        if (`$r.Removed) { `$removed++; `$freed += [int64]`$r.Bytes } else { `$vetoed++ }
+        `$freed += [int64]`$r.Bytes
+        if (`$r.Removed) { `$removed++ } else { `$vetoed++ }
     }
-    [pscustomobject]@{ Ok = (`$vetoed -eq 0); Bytes = `$freed; Detail = ('removed {0}' -f `$removed) }
+    [pscustomobject]@{ Attempted = @(`$items).Count; Removed = `$removed; Vetoed = `$vetoed
+                       Locked = 0; Gone = 0; Bytes = `$freed; Detail = ('removed {0}' -f `$removed) }
 }" | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
 
     '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"applymod","enabled":true,"order":10}] }' |
@@ -1943,6 +1946,260 @@ function Repair-PMModule {
         return ($j.mode -eq 'apply' -and $j.modules[0].status -eq 'applied' -and
                 [int64]$j.summary.bytes -eq 2000 -and $gone)
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== a repair that removed NOTHING must not go green (BACKLOG 7h) ==" -ForegroundColor Cyan
+# The defect, reproduced end to end before this section was written. Remove-PMPath's catch arm
+# returns Removed=$false with Reason "partially removed then failed: IOException";
+# Get-PMRemovalBucket correctly calls that 'locked'; and all four modules then computed
+# Ok = ($vetoed -eq 0). So a Repair in which every one of 940 deletes was LOCKED returned
+# Ok = $true -> the dispatcher's two-way map made it 'applied' -> summary.applied++ ->
+# Get-PMStatusPresentation drew a green "Cleaned" badge -> exit 0, and the weekly SYSTEM task
+# reported a successful cleanup that had freed nothing. Only the Detail string was honest.
+It 'the headline case: 940 locked, 0 vetoed, 0 removed is NOT applied' {
+    (Get-PMRepairOutcome -Attempted 940 -Removed 0 -Vetoed 0 -Locked 940 -Gone 0).Status -ne 'applied'
+}
+foreach ($case in @(
+    @{ N = 'everything it set out to remove went';       A = 940; R = 940; V = 0; L = 0;   G = 0;   E = 'applied' }
+    @{ N = 'the ones that vanished do not count against it'; A = 940; R = 900; V = 0; L = 0; G = 40; E = 'applied' }
+    @{ N = 'they had all vanished before Repair ran';    A = 940; R = 0;   V = 0; L = 0;   G = 940; E = 'applied' }
+    @{ N = 'there was nothing left to do at all';        A = 0;   R = 0;   V = 0; L = 0;   G = 0;   E = 'applied' }
+    @{ N = '940 locked and nothing removed';             A = 940; R = 0;   V = 0; L = 940; G = 0;   E = 'error' }
+    @{ N = 'some removed, some still locked';            A = 940; R = 900; V = 0; L = 40;  G = 0;   E = 'incomplete' }
+    @{ N = 'one veto outweighs 939 successes';           A = 940; R = 939; V = 1; L = 0;   G = 0;   E = 'error' }
+    @{ N = 'a veto is a failure with nothing else wrong'; A = 1;  R = 0;   V = 1; L = 0;   G = 0;   E = 'error' })) {
+    $c = $case
+    It ("outcome: {0} -> {1}" -f $c.N, $c.E) {
+        (Get-PMRepairOutcome -Attempted $c.A -Removed $c.R -Vetoed $c.V -Locked $c.L -Gone $c.G).Status -eq $c.E
+    }
+}
+It 'the outcome and the sentence describing it come out of the same call' {
+    # Four modules carried four verbatim copies of that format string. Deriving both from one
+    # place is the same argument that produced Get-PMRemovalBucket one layer down, whose own
+    # docstring records three of those four copies having already drifted apart.
+    $o = Get-PMRepairOutcome -Attempted 940 -Removed 0 -Vetoed 0 -Locked 940 -Gone 0
+    ($o.Detail -like '*removed 0 of 940*') -and ($o.Detail -like '*940 locked*')
+}
+It 'every shipped module derives its Repair result from that one mapping' {
+    # AST, not a source grep: a regex cannot tell a call from the same text inside a comment or
+    # a here-string, and this suite has retired source-text greps once already for that reason.
+    $missing = @()
+    foreach ($m in (Get-ChildItem -LiteralPath (Join-Path $script:RepoRoot 'modules') -Directory)) {
+        $file = Join-Path $m.FullName 'module.ps1'
+        $errs = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$errs)
+        if ($errs -and $errs.Count) { $missing += $m.Name; continue }
+        $calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                    Where-Object { $_.GetCommandName() -eq 'Get-PMRepairOutcome' })
+        if (-not $calls.Count) { $missing += $m.Name }
+    }
+    return ($missing.Count -eq 0)
+}
+It 'the amber status is explicitly mapped, not green and not the default arm' {
+    # Colour alone is never the claim here - the icon and the word carry it - so all three have
+    # to move. Falling through to the default arm would render Icon '?' and the raw status as
+    # the word, which reads as "unknown", not as "this did not finish".
+    $p = Get-PMStatusPresentation -Status 'incomplete'
+    $green = Get-PMStatusPresentation -Status 'applied'
+    ($p.Role -eq 'warning') -and ($p.Role -ne 'good') -and ($p.Word -ne $green.Word) -and
+    ($p.Word -ne 'incomplete') -and ($p.Icon -ne '?')
+}
+It 'and it opens a tile of its own, so what it counted is not invisible' {
+    # Every status the dispatcher can write needs somewhere in the report to land. Without a
+    # tile of its own an amber module would appear only in "Modules run", and the reader would
+    # have to notice a badge to know anything happened.
+    $mods = @([ordered]@{ id = 'm'; status = 'incomplete'; detail = 'removed 1 of 2'
+                          bytes = [int64]500; count = 2; items = @(); readErrorMessages = @() })
+    (@(Get-PMTileRows -Kind 'incomplete' -Modules $mods).Count -eq 1) -and
+    (@($script:PMTileSpec | Where-Object { $_.Kind -eq 'incomplete' }).Count -eq 1)
+}
+
+Write-Host "`n== ...proved with -Apply against a really locked file ==" -ForegroundColor Cyan
+function New-PMLockedApplyFixture {
+    <#
+        Cloned from the -Apply fixture above, with the one difference that matters: each
+        candidate directory holds six droppable files plus one called zz-locked.bin, which the
+        caller opens with FileShare::None before the run. Remove-Item -Recurse then deletes
+        everything it can and throws IOException on that one - the real shape of a locked
+        repair rather than a simulated Reason string.
+
+        The NAME is load-bearing and must not be tidied. NTFS returns directory entries in name
+        order, and measured both ways on this box: with the locked file sorting LAST, 6,000 of
+        6,050 bytes are freed before the throw; with it sorting FIRST, Remove-Item aborts on it
+        and frees nothing, which would silently turn the partial-bytes assertion into a
+        tautology.
+
+        Its Repair returns the counters the dispatcher decides on AND the legacy
+        Ok = ($vetoed -eq 0). The legacy field is deliberate: it is exactly what the old
+        dispatcher trusted, and it is $true in precisely the all-locked case. Leaving it here
+        pins that no module can re-open 7h by self-reporting success.
+    #>
+    param([AllowEmptyCollection()][string[]]$Locked = @(), [AllowEmptyCollection()][string[]]$Free = @())
+    $fx   = New-PMFixtureRoot -Prefix "pm-locked-"
+    $data = Join-Path $fx 'data'
+    $md   = Join-Path $fx 'modules\lockmod'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    foreach ($d in (@($Locked) + @($Free))) {
+        $dir = Join-Path $data $d
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        foreach ($n in 0..5) {
+            Set-Content -LiteralPath (Join-Path $dir "a$n.bin") -Value ('x' * 1000) -Encoding Ascii -NoNewline
+        }
+    }
+    foreach ($d in @($Locked)) {
+        Set-Content -LiteralPath (Join-Path (Join-Path $data $d) 'zz-locked.bin') -Value ('x' * 50) -Encoding Ascii -NoNewline
+    }
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $script:RepoRoot 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    @(
+        '@{'
+        "    Id = 'lockmod'; Name = 'Lock'; Category = 'maintenance'; Version = '1.0.0'"
+        '    RequiresUserSid = $false'
+        '    AutoApply = $true'
+        "    Roots = @('$data')"
+        "    Entry = 'module.ps1'; Description = 'fixture'"
+        '}'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    @(
+        "`$script:DataRoot = '$data'"
+        'function Get-Candidates {'
+        '    param($Context)'
+        '    $out = @()'
+        '    foreach ($d in (Get-PMChildDirectory -Path $script:DataRoot -Critical)) {'
+        '        $out += [pscustomobject]@{ Path = $d.FullName; Bytes = (Get-PMPathSize -Path $d.FullName) }'
+        '    }'
+        '    return $out'
+        '}'
+        'function Test-PMModule {'
+        '    param($Context)'
+        '    $items = @(Get-Candidates -Context $Context)'
+        '    [pscustomobject]@{ Clean = $false; Count = @($items).Count; Detail = "fixture"'
+        '                       Bytes = [int64](@($items | Measure-Object Bytes -Sum).Sum); Items = @() }'
+        '}'
+        'function Repair-PMModule {'
+        '    param($Context)'
+        '    $items = @(Get-Candidates -Context $Context)'
+        '    $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0'
+        '    foreach ($i in $items) {'
+        '        $r = Remove-PMPath -Path $i.Path -Roots @($script:DataRoot) -DeclaredRoots @($Context.DeclaredRoots) -KnownBytes ([int64]$i.Bytes)'
+        '        $freed += [int64]$r.Bytes'
+        '        if ($r.Removed) { $removed++; continue }'
+        '        switch (Get-PMRemovalBucket -Reason $r.Reason) {'
+        '            "vetoed" { $vetoed++ }'
+        '            "gone"   { $gone++ }'
+        '            default  { $locked++ }'
+        '        }'
+        '    }'
+        '    [pscustomobject]@{'
+        '        Ok = ($vetoed -eq 0)'
+        '        Attempted = @($items).Count; Removed = $removed; Vetoed = $vetoed; Locked = $locked; Gone = $gone'
+        '        Bytes = $freed; Detail = ("removed {0} of {1}" -f $removed, @($items).Count)'
+        '    }'
+        '}'
+    ) | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"lockmod","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    return @{ Fixture = $fx; Data = $data }
+}
+
+It 'every delete locked: the run reports error, applies nothing, and the PROCESS exits 1' {
+    # Task Scheduler only ever sees the process exit code, so that is asserted separately from
+    # the JSON. Before the fix this run recorded status 'applied', summary.applied = 1 and
+    # exit 0 - a green "Cleaned" badge over 0 bytes freed.
+    $f = New-PMLockedApplyFixture -Locked @('one')
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream((Join-Path $f.Data 'one\zz-locked.bin'),
+                    [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $f.Fixture 'Invoke-PcMaintenance.ps1') -Apply -NoReport 2>&1
+        $code = $LASTEXITCODE
+        $j = Get-Content -LiteralPath (Join-Path $f.Fixture 'logs\latest.json') -Raw | ConvertFrom-Json
+        # 6,000 of 6,050 B: a FAILED repair still destroyed most of that directory, and the run
+        # record has to say so. Only 'applied' used to add to summary.bytes, so this number was
+        # 0 twice over - once because the module dropped it, once because the dispatcher did.
+        return (($j.modules[0].status -ne 'applied') -and ($j.modules[0].status -eq 'error') -and
+                ([int]$j.summary.applied -eq 0) -and ([int64]$j.summary.bytes -eq 6000) -and
+                ([int]$j.modules[0].repair.locked -eq 1) -and ($code -eq 1))
+    } finally {
+        if ($fs) { $fs.Dispose() }
+        Remove-Item -LiteralPath $f.Fixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+It 'one locked among two is amber: bytes credited, weekly job still green' {
+    # The exit-code judgement, pinned. One locked file in a 940-item sweep must not turn a
+    # weekly SYSTEM task red - a permanent benign red is how a control gets ignored, which is
+    # the same reasoning already applied to partial READ coverage - but it must not read as
+    # "Cleaned" either.
+    #
+    # 12,000 B: 6,000 from the candidate that went whole, plus the 6,000 that a PARTIAL delete
+    # freed out of the locked one. That second number is the other half of 7h. Remove-PMPath
+    # re-measures after a throw precisely so it can report it, and all four modules threw it
+    # away, recording 0 B in the record that stands in for a backup.
+    $f = New-PMLockedApplyFixture -Locked @('one') -Free @('two')
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream((Join-Path $f.Data 'one\zz-locked.bin'),
+                    [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $f.Fixture 'Invoke-PcMaintenance.ps1') -Apply -NoReport 2>&1
+        $code = $LASTEXITCODE
+        $j = Get-Content -LiteralPath (Join-Path $f.Fixture 'logs\latest.json') -Raw | ConvertFrom-Json
+        return (($j.modules[0].status -eq 'incomplete') -and ([int]$j.summary.applied -eq 0) -and
+                ([int]$j.summary.incomplete -eq 1) -and ([int]$j.summary.errors -eq 0) -and
+                ([int64]$j.summary.bytes -eq 12000) -and ($code -eq 0))
+    } finally {
+        if ($fs) { $fs.Dispose() }
+        Remove-Item -LiteralPath $f.Fixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`n== ...and against a SHIPPED module, not only a fixture ==" -ForegroundColor Cyan
+function Invoke-PMModuleRepair {
+    <#
+        Run ONE shipped module's Repair-PMModule against a fixture root, the same way
+        Invoke-PMModuleTest runs its Test: own & {} scope, root resolver replaced by name after
+        the module is dot-sourced.
+
+        The phase stamp is set here because that is what the dispatcher does in production, and
+        without it Remove-PMPath refuses every delete with "this run did not grant apply" - the
+        test would then measure the refusal instead of the lock and pass for the wrong reason.
+        It is cleared afterwards: the stamp lives in THIS script's scope, so leaking it would
+        change how every later test's Remove-PMPath behaves.
+    #>
+    param([string]$ModuleId, [string]$RootResolver, [string]$FixtureRoot)
+    try {
+        & {
+            param($libDir, $entry, $resolver, $fixture)
+            Get-ChildItem $libDir -Filter *.ps1 | ForEach-Object { . $_.FullName }
+            . $entry
+            Set-Item -Path "function:$resolver" -Value ([scriptblock]::Create("param(`$Context) '$fixture'"))
+            $script:PMPhaseName = 'Repair'; $script:PMPhaseApply = $true; $script:PMPhaseRoots = @($fixture)
+            Clear-PMReadErrors
+            Repair-PMModule -Context @{ UserProfile = $null; DeclaredRoots = @($fixture); KnownSizes = @{} }
+        } (Join-Path $script:RepoRoot 'lib') (Join-Path $script:RepoRoot "modules\$ModuleId\module.ps1") $RootResolver $FixtureRoot
+    } finally {
+        $script:PMPhaseName = $null; $script:PMPhaseApply = $null; $script:PMPhaseRoots = $null
+    }
+}
+It 'stale-app-temp: all locked is an error, and the bytes it DID free are recorded' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("pm-shipped-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $cand = Join-Path $root 'Adobe'      # a name on this module's allowlist
+    New-Item -ItemType Directory -Path $cand -Force | Out-Null
+    foreach ($n in 0..5) { Set-Content -LiteralPath (Join-Path $cand "a$n.bin") -Value ('x' * 1000) -Encoding Ascii -NoNewline }
+    Set-Content -LiteralPath (Join-Path $cand 'zz-locked.bin') -Value ('x' * 50) -Encoding Ascii -NoNewline
+    (Get-Item -LiteralPath $cand).LastWriteTime = (Get-Date).AddDays(-60)   # past the staleness floor
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream((Join-Path $cand 'zz-locked.bin'),
+                    [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        $r = Invoke-PMModuleRepair -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $root
+        $status = (Get-PMRepairOutcome -Attempted $r.Attempted -Removed $r.Removed -Vetoed $r.Vetoed `
+                                       -Locked $r.Locked -Gone $r.Gone).Status
+        return (($status -eq 'error') -and ([int]$r.Removed -eq 0) -and ([int]$r.Locked -eq 1) -and
+                ([int]$r.Vetoed -eq 0) -and ([int64]$r.Bytes -eq 6000))
+    } finally {
+        if ($fs) { $fs.Dispose() }
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host "`n== a CHANGE is claimed only where it was proved ==" -ForegroundColor Cyan

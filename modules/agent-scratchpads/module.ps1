@@ -114,7 +114,15 @@ function Repair-PMModule {
     foreach ($i in $items) {
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
-        if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
+        # Credited BEFORE the success test, and outside it. Remove-Item -Recurse can delete most
+        # of a tree and then throw, and Remove-PMPath re-measures precisely so it can report
+        # what it did free - "the one thing the audit trail must never get wrong", says the
+        # comment there. All four modules then discarded that number, because this guard only
+        # credited a full success: a partial delete recorded 0 B in the record that stands in
+        # for a backup. Measured on 2026-09-10 with one locked file: 6,000 of 6,050 B really
+        # gone, logged as nothing. Bytes is 0 on every other outcome, so this is unconditional.
+        $freed += [int64]$r.Bytes
+        if ($r.Removed) { $removed++; continue }
         # One shared mapping in PMCommon, not a copy per module. This module was the only one
         # that had the '*declared*' arm; the other three counted that refusal as 'locked', which
         # left Ok = ($vetoed -eq 0) TRUE over a run the guard had refused outright.
@@ -124,10 +132,20 @@ function Repair-PMModule {
             default  { $locked++ }
         }
     }
+    # Counters, not a verdict. Ok = ($vetoed -eq 0) used to travel from here, and it answered
+    # "did the guard refuse anything?" while the dispatcher read it as "did the cleanup work?" -
+    # BACKLOG 7h. The dispatcher now decides from these numbers with the same shared function,
+    # for the reason the declared roots are its and not the module's: a module's own verdict on
+    # its own run is self-certification.
+    $outcome = Get-PMRepairOutcome -Attempted @($items).Count -Removed $removed `
+                                   -Vetoed $vetoed -Locked $locked -Gone $gone
     [pscustomobject]@{
-        Ok     = ($vetoed -eq 0)
-        Bytes  = $freed
-        Detail = ('removed {0} of {1}; {2} vetoed by the path guard, {3} locked, {4} already gone' -f
-                    $removed, @($items).Count, $vetoed, $locked, $gone)
+        Attempted = @($items).Count
+        Removed   = $removed
+        Vetoed    = $vetoed
+        Locked    = $locked
+        Gone      = $gone
+        Bytes     = $freed
+        Detail    = $outcome.Detail
     }
 }

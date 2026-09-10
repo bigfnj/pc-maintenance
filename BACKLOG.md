@@ -585,7 +585,7 @@ is exactly what `Test-PMApplyAllowed` (`PMManifest.ps1:166-175`) was changed to 
 psd1 ever said `AutoApply = 'false'`, `[bool]'false'` is `$true`: the test stays green while the
 module has silently become report-only.
 
-### 7h. An all-locked repair renders a green "Cleaned" badge
+### 7h. ~~An all-locked repair renders a green "Cleaned" badge~~ DONE 2026-09-10
 
 `modules/*/module.ps1` set `Ok = ($vetoed -eq 0)`. A Repair in which every delete was **locked**
 rather than vetoed therefore returns `Ok = $true` -> status `applied` -> a green "Cleaned" badge
@@ -593,6 +593,49 @@ rather than vetoed therefore returns `Ok = $true` -> status `applied` -> a green
 locked") is honest, and the comment directly above says *"Ok reflects what actually happened."*
 Not demonstrated - exercising it needs `-Apply`, which the audit was not permitted to run - so
 confirm before changing.
+
+**Confirmed, then fixed.** Reproduced end to end with `-Apply` against a TEMP fixture, holding one
+exclusive `FileStream` so `Remove-Item -Recurse` threw `IOException`: status `applied`, badge
+`Role 'good' / Icon 'OK' / Word 'Cleaned'`, `summary.applied = 1`, `summary.bytes = 0`, process
+exit **0**. Every hop in the chain the audit described was real.
+
+`Get-PMRepairOutcome` (PMCommon, beside `Get-PMRemovalBucket` for the reason recorded there) now
+maps counters to one of three outcomes, and **the dispatcher calls it** rather than trusting a
+module-supplied boolean - a module's verdict on its own run is self-certification, the same
+argument that made the declared roots the dispatcher's. Modules return `Attempted/Removed/Vetoed/
+Locked/Gone`, which also land in the run JSON as `modules[].repair`. `applied` = everything it set
+out to remove is gone (green, exit 0); `incomplete` = some went and something is still locked
+(amber "Not fully cleaned", exit 0); `error` = it removed nothing, **or** the guard vetoed
+anything at all (red, exit 1).
+
+The name is `incomplete`, not `partial`: `summary.partial` already exists and counts unreadable
+LOCATIONS, and `Get-PMTileRows` already has a `'partial'` kind for it. Two unrelated quantities
+under one word, in a log format retained 50 runs deep and diffed week to week, would have been
+worse than the bug. Checked for collisions across the run JSON, the report and the suite before
+settling; `incomplete` appeared nowhere.
+
+**A veto is a hard failure regardless of what else succeeded** - the guard refusing a target means
+a module asked to delete something it may not touch. A locked file is not: one open handle among
+940 items is ordinary on a machine in use, so it goes amber and the weekly SYSTEM task stays
+green. A permanent benign red is how a control gets ignored, which is the judgement already
+recorded for partial read coverage.
+
+**Second defect in the same four lines, fixed with it.** `Remove-PMPath` re-measures after a throw
+and returns the bytes it *did* free - "the one thing the audit trail must never get wrong" - and
+all four modules discarded that number because the credit sat inside `if ($r.Removed)`. So did the
+dispatcher, which only added to `summary.bytes` on success. Measured on the same fixture: 6,000 of
+6,050 bytes really gone, recorded as 0 B twice over. There is no backup here; the run log is the
+entire record of what was destroyed.
+
+16 new tests, every one confirmed to FAIL first (274 -> 290, 0 failed): the outcome table, the
+presentation and tile mapping, an AST check that all four shipped modules go through the shared
+function, two dispatcher `-Apply` runs against a really locked file (all-locked -> `error` +
+`summary.applied = 0` + `summary.bytes = 6000` + **process exit 1**; one-of-two locked ->
+`incomplete` + exit **0** + 12,000 B credited), and one against the shipped `stale-app-temp`
+Repair rather than a fixture module. The locked file is named `zz-locked.bin` on purpose: NTFS
+returns entries in name order, and measured both ways - sorting LAST frees 6,000 B before the
+throw, sorting FIRST aborts immediately and frees nothing, which would have made the
+partial-bytes assertion a tautology.
 
 ### 7i. Dead manifest keys, ~100 lines of them
 
