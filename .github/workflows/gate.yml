@@ -1,0 +1,65 @@
+name: gate
+
+# WINDOWS POWERSHELL 5.1, NOT pwsh - and that is the whole point of this file.
+#
+# GitHub's Windows runners default to `shell: pwsh`, and this project's own guidance warns that
+# CI running 7 while production runs 5.1 is how a green build ships a broken script: `&&`, `??`
+# and ternary parse cleanly under 7 and are parse ERRORS under 5.1; Get-WmiObject and
+# -Encoding Byte exist in one and not the other; Set-Content defaults to ANSI on 5.1 and UTF-8
+# on 7. The weekly SYSTEM task on the target machine runs powershell.exe. A CI job that
+# validated 7 would be checking a host nothing uses.
+#
+# WHAT IS DELIBERATELY NOT HERE. Only the host-independent suite runs. The deployment smoke
+# reads a live installation under C:\ProgramData and the report checks read a real Downloads
+# folder, so on a runner they would either fail for environmental reasons or - worse - SKIP
+# and report green, which is the exact defect class this repository has spent an audit round
+# removing. A check that cannot fail on CI is worse than no check on CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Confirm the host really is 5.1
+        shell: powershell
+        run: |
+          $v = $PSVersionTable.PSVersion
+          "host: $v ($($PSVersionTable.PSEdition))"
+          if ($v.Major -ne 5) {
+            Write-Error "expected Windows PowerShell 5.x, got $v - this job is checking the wrong host"
+            exit 1
+          }
+
+      - name: Unit suite
+        shell: powershell
+        run: |
+          .\tests\Invoke-Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # A parse error under 5.1 in a file the suite does not dot-source would otherwise reach
+      # the scheduled task and fail silently at 03:00 on a Sunday. The suite already parses
+      # every .ps1 it can see; this is the belt to that braces and costs a second.
+      - name: Every script parses under 5.1
+        shell: powershell
+        run: |
+          $bad = 0
+          Get-ChildItem -Recurse -Filter *.ps1 | ForEach-Object {
+            $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$e)
+            if ($e -and $e.Count) {
+              $bad++
+              Write-Host ("FAIL {0}: {1}" -f $_.Name, $e[0].Message)
+            }
+          }
+          if ($bad) { exit 1 }
+          "all .ps1 parse under $($PSVersionTable.PSVersion)"
