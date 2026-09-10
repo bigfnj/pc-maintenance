@@ -29,8 +29,27 @@ function Get-StaleAppCandidates {
     # it is the copy the next module gets cloned from.
     $out = New-Object 'System.Collections.Generic.List[object]'
     foreach ($d in (Get-PMChildDirectory -Path $root -Critical)) {
-        $named    = $script:StaleAppNames -contains $d.Name
-        $prefixed = @($script:StaleAppPrefixes | Where-Object { $d.Name.StartsWith($_, 'OrdinalIgnoreCase') }).Count -gt 0
+        $named = $script:StaleAppNames -contains $d.Name
+        # foreach + break, not `@($prefixes | Where-Object {...}).Count -gt 0`. The pipeline form
+        # built a scriptblock invocation, a pipeline and a collection FOR EVERY DIRECTORY in
+        # TEMP, whether or not anything matched. Measured 2026-09-10 over 17,403 real Temp
+        # names, best of three: 1,758 ms -> 63 ms, 27.8x. (BACKLOG 7k recorded 45x from a 13,088
+        # -name run; the 'before' reproduces, the 'after' does not - see the item.) TEMP here
+        # holds five figures of directories and the allowlist matches a handful, so the loop
+        # exits on the first hit and the overwhelming majority pay two StartsWith calls.
+        #
+        # The overload is load-bearing, and all three of its forms are spelled almost the same:
+        #   StartsWith($p)                            - CULTURE-sensitive, and locale-dependent
+        #   StartsWith($p, [StringComparison]::Ordinal) - case-SENSITIVE, misses 7zo*
+        #   StartsWith($p, [StringComparison]::OrdinalIgnoreCase) - the rule this module means
+        # 7-Zip writes both cases of its 7zO/7zS scratch, so ordinal goes blind to half of it.
+        # Pinned by 'stale: the prefix list is case-INSENSITIVE, not ordinal'.
+        $prefixed = $false
+        if (-not $named) {
+            foreach ($p in $script:StaleAppPrefixes) {
+                if ($d.Name.StartsWith($p, [StringComparison]::OrdinalIgnoreCase)) { $prefixed = $true; break }
+            }
+        }
         if (-not ($named -or $prefixed)) { continue }
         if ($d.LastWriteTime -ge $cut) { continue }
         $out.Add([pscustomobject]@{

@@ -478,12 +478,48 @@ function Add-PMReadError {
 # made it, rather than quietly becoming a narrower function.
 
 function Get-PMChildDirectory {
+    <#
+        Native enumeration, NOT Get-ChildItem. Measured 2026-09-10 against the real user TEMP,
+        17,694 directories, best of three: 685 ms / 59.3 MB -> 32 ms / 6.4 MB. 21x faster and
+        9.2x lighter, for the same name set. Every module's candidate loop starts here, so this
+        is the tool's most-run read.
+
+        Three things a naive swap loses, each recorded because each has already cost something:
+
+        1. .ToArray(), NEVER the List itself. `@($emptyGenericList)` throws "Argument types do
+           not match" under 5.1 - the same trap Get-PMReadErrorSample documents, which broke
+           eight tests at once. Every caller wraps this in @(), so the empty result is the
+           common path, not the edge case.
+
+        2. RAW DirectoryInfo objects. Wrapping each entry in a pscustomobject was measured at
+           253 ms against 41 ms - it throws away 80% of the win - and it breaks every caller
+           reading .Name, .FullName or .LastWriteTime off the result.
+
+        3. -Force is preserved by construction: EnumerateDirectories() returns hidden and
+           system entries, which Get-ChildItem only does with -Force. Application scratch under
+           TEMP is routinely hidden, so losing that would make a module report clean about
+           directories it never listed. Pinned by 'Get-PMChildDirectory returns HIDDEN and
+           SYSTEM directories'.
+
+        NON-RECURSIVE, and that is what makes ONE try/catch honest. -ErrorVariable records one
+        error per unreadable location; over a single non-recursive listing there is exactly one
+        location, so the two are equivalent. THAT EQUIVALENCE DIES THE MOMENT ANYONE ADDS
+        -Recurse - a single catch would then collapse every unreadable subtree in the walk into
+        one recorded error and abandon the rest of the enumeration. If a recursive form is ever
+        wanted, it needs the per-directory Stack shape Get-PMTreeStat uses, not a switch here.
+    #>
     param([Parameter(Mandatory)][string]$Path, [switch]$Critical)
     if (-not [IO.Directory]::Exists($Path)) { return @() }
-    $ev = $null
-    $r = @(Get-ChildItem -LiteralPath $Path -Force -Directory -ErrorAction SilentlyContinue -ErrorVariable ev)
-    Add-PMReadError -Errors $ev -Critical:$Critical
-    return $r
+    $out = New-Object 'System.Collections.Generic.List[System.IO.DirectoryInfo]'
+    try {
+        foreach ($d in (New-Object System.IO.DirectoryInfo($Path)).EnumerateDirectories()) { $out.Add($d) }
+    } catch {
+        # Lazy enumeration, so a failure part-way through keeps what was already listed - which
+        # is strictly more honest than the all-or-nothing the cmdlet gave, and the error is
+        # still recorded either way.
+        Add-PMReadError -Errors $_ -Critical:$Critical
+    }
+    return $out.ToArray()
 }
 
 function Get-PMChildFile {

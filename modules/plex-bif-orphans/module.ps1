@@ -2,8 +2,10 @@
 <#
     plex-bif-orphans - the .tmp Plex leaves beside every preview it generates.
 
-    The Media directory is a junction to another volume on this box; Get-ChildItem follows it,
-    so the module needs no knowledge of where it actually lands.
+    The Media directory is a junction to another volume on this box. Get-PlexMediaRoot resolves
+    that ONE link up front, so the module needs no knowledge of where it actually lands - and
+    the walk below then descends no junction it meets inside, exactly as the deletion will not.
+    Those are two different rules about the same kind of object; do not collapse them.
 #>
 
 function Get-PlexMediaRoot {
@@ -35,7 +37,7 @@ function Get-PlexOrphanCandidates {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root = Get-PlexMediaRoot -Context $Context
     if (-not (Test-PMPath -Path $root)) { return @() }
-    # ONE walk, unfiltered, into a set. Two reasons beyond speed:
+    # ONE STREAMING walk. Two rules survive from the version this replaced:
     #
     # 1. -Filter '*.tmp' is not the same as "ends in .tmp". The Win32 filter also matches longer
     #    extensions (the 8.3 legacy), so 'index.bif.tmpx' would have matched and the blind
@@ -44,19 +46,71 @@ function Get-PlexOrphanCandidates {
     # 2. Testing each candidate's partner with Test-PMPath cost one stat per orphan - 6,935 of
     #    them at the documented peak. A HashSet built during the same walk answers in O(1).
     #
+    # What changed, and why, is MEMORY. `@(Get-PMChildFile -Recurse)` materialised a FileInfo
+    # for every file in the tree and held the whole array alive alongside the set that was built
+    # from it. Only the full paths and the .tmp entries are ever read again. Measured 2026-09-10
+    # on the real tree - see the reported numbers in BACKLOG 7k. Do NOT expect a time win: this
+    # tree averages barely more than one file per directory, so the directory opens dominate and
+    # the FileInfo materialisation this removes is a small slice of the total. The 2x originally
+    # recorded does not reproduce.
+    #
     # Critical: this scan IS the module's answer. If it fails the module knows nothing, which is
-    # a different thing from knowing there is nothing.
-    $all = @(Get-PMChildFile -Path $root -Recurse -Critical)
+    # a different thing from knowing there is nothing. That makes the two traps below fatal
+    # rather than untidy - each turns "went blind" into "found nothing", silently.
+    #
+    # Stack + per-directory enumeration, NOT EnumerateFiles(AllDirectories), copying the shape
+    # Get-PMTreeStat already uses in PMCommon for exactly these two reasons:
+    #
+    #   a. AllDirectories FOLLOWS reparse points, while Get-ChildItem -Recurse and Remove-Item
+    #      -Recurse do not (re-verified under 5.1). Descending a junction would report, and then
+    #      DELETE, files outside the tree this module scanned and declared.
+    #   b. AllDirectories ABORTS the entire enumeration at the first directory it cannot read.
+    #      Get-ChildItem -Recurse -ErrorVariable recorded one error per unreadable LOCATION and
+    #      carried on, so the per-directory try/catch below is what preserves that accounting.
+    #      Every unreadable subtree is -Critical here because the scan is the answer.
+    #
+    # The root is pushed unconditionally, matching the old reader: Get-ChildItem enumerated the
+    # CONTENTS of a reparse-point root and only declined to descend reparse points found within
+    # it. (Get-PlexMediaRoot has already resolved the Media junction by this point anyway.)
     $present = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($f in $all) { $null = $present.Add($f.FullName) }
+    $temps   = New-Object 'System.Collections.Generic.List[object]'
+    $stack   = New-Object 'System.Collections.Generic.Stack[string]'
+    $stack.Push($root)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        try {
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            foreach ($f in $di.EnumerateFiles()) {
+                $null = $present.Add($f.FullName)
+                # Collected, NOT judged. See the second pass below.
+                if ($f.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) {
+                    # .Length comes off the enumeration's own WIN32_FIND_DATA, so this keeps the
+                    # size without keeping the FileInfo - which is the whole saving.
+                    $temps.Add([pscustomobject]@{ Path = $f.FullName; Bytes = [int64]$f.Length })
+                }
+            }
+            foreach ($sub in $di.EnumerateDirectories()) {
+                # Do not descend a junction or symlink: neither will the deletion.
+                if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+                $stack.Push($sub.FullName)
+            }
+        } catch {
+            # One unreadable directory must not abandon the rest of the tree, and must not pass
+            # silently either. One error per location, which is what -ErrorVariable gave.
+            Add-PMReadError -Errors $_ -Critical
+        }
+    }
+    # SECOND PASS, and it has to be. A .tmp can be enumerated before the finished file that
+    # supersedes it - directory order is not defined and the partner may live in a directory
+    # still on the stack - so judging during the walk would spare real orphans depending on
+    # nothing but enumeration order, differently on each run.
     $out = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($f in $all) {
-        if (-not $f.Name.EndsWith('.tmp', [StringComparison]::OrdinalIgnoreCase)) { continue }
+    foreach ($t in $temps) {
         # The pairing IS the rule. A .tmp whose finished sibling is absent may be a generation
         # still running, so it survives; only a temp file the real artifact has superseded goes.
-        $base = $f.FullName.Substring(0, $f.FullName.Length - 4)
+        $base = $t.Path.Substring(0, $t.Path.Length - 4)
         if (-not $present.Contains($base)) { continue }
-        $out.Add([pscustomobject]@{ Path = $f.FullName; Bytes = [int64]$f.Length })
+        $out.Add($t)
     }
     return $out.ToArray()
 }

@@ -250,10 +250,55 @@ It 'the read-error collector records instead of swallowing' {
 }
 It 'only a CRITICAL read failure invalidates the answer' {
     Clear-PMReadErrors
-    try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ }
-    try { Get-ChildItem -LiteralPath 'C:\__nope__' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ -Critical }
+    try { Get-ChildItem -LiteralPath 'C:\__nope__a' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ }
+    try { Get-ChildItem -LiteralPath 'C:\__nope__b' -ErrorAction Stop } catch { Add-PMReadError -Errors $_ -Critical }
     return ((Get-PMReadErrorCount) -eq 2 -and (Get-PMCriticalReadErrorCount) -eq 1)
 }
+Write-Host "`n== the directory reader's -Force semantic, which an enumerator swap loses ==" -ForegroundColor Cyan
+It 'Get-PMChildDirectory returns HIDDEN and SYSTEM directories, and only directories' {
+    # -Force is not decoration. Application scratch under TEMP is routinely hidden or system,
+    # and Get-ChildItem WITHOUT it silently omits exactly those - so a module reports clean
+    # while the thing it was hunting sits in a listing it never saw. Nothing pinned this, which
+    # is what makes it the risk in any swap to a native enumerator.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-hid-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    foreach ($n in 'plain', 'hidden', 'system') { New-Item -ItemType Directory -Path (Join-Path $d $n) -Force | Out-Null }
+    Set-Content -LiteralPath (Join-Path $d 'afile.txt') -Value 'x' -Encoding UTF8
+    try {
+        foreach ($p in @(@{ N = 'hidden'; A = [IO.FileAttributes]::Hidden }, @{ N = 'system'; A = [IO.FileAttributes]::System })) {
+            $i = Get-Item -LiteralPath (Join-Path $d $p.N) -Force
+            $i.Attributes = ($i.Attributes -bor $p.A)
+        }
+        # Exhaustive, not -contains. The file has to be ABSENT too: a swap to
+        # EnumerateFileSystemInfos would return hidden directories and also start handing
+        # callers files to delete, and a -contains assertion would applaud it.
+        $names = @(Get-PMChildDirectory -Path $d | ForEach-Object { $_.Name }) | Sort-Object
+        return (($names -join ',') -eq 'hidden,plain,system')
+    } finally {
+        # Attributes cleared first: Remove-Item leaves a system directory behind without -Force
+        # on every ancestor, and a stray undeletable fixture would outlive the run.
+        Get-ChildItem -LiteralPath $d -Force -Directory | ForEach-Object { $_.Attributes = [IO.FileAttributes]::Directory }
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+It 'Get-PMChildDirectory hands back DirectoryInfo, and an empty result survives @()' {
+    # Two regressions in one, both already recorded in PMCommon and neither visible to any
+    # other test. Wrapping each entry in a pscustomobject breaks callers reading
+    # .LastWriteTime, and returning the generic List makes `@($result)` throw "Argument types
+    # do not match" under 5.1 - the mistake that broke eight tests at once. Every caller wraps
+    # in @(), so the empty case is the live one.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-di-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $empty = Join-Path $d 'one'
+    New-Item -ItemType Directory -Path $empty -Force | Out-Null
+    try {
+        $got  = @(Get-PMChildDirectory -Path $d)
+        $none = @(Get-PMChildDirectory -Path $empty)      # the @() that used to throw
+        return (($got.Count -eq 1) -and ($got[0] -is [IO.DirectoryInfo]) -and
+                ($got[0].FullName -eq $empty) -and ($got[0].LastWriteTime -is [datetime]) -and
+                ($none.Count -eq 0))
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== blind is not clean, continued ==" -ForegroundColor Cyan
 It 'the dispatcher checks unverified BEFORE it checks clean' {
     # Order is the whole guarantee. If the clean branch ran first, a module that could not read
     # would return Clean=$true and continue out before anything noticed. Asserting only that the
@@ -954,8 +999,15 @@ function New-PMUnreadableDir {
         Returns $null if the condition could not be produced, so the caller SKIPs loudly rather
         than passing vacuously. Cleanup goes through icacls /reset, NOT Set-Acl: removing a deny
         ACE via Set-Acl wants SeSecurityPrivilege and leaves an undeletable directory behind.
+
+        -Path places the deny INSIDE an existing fixture, which is what makes the unreadable
+        SUBDIRECTORY case testable: an unreadable ROOT leaves nothing to walk, so it cannot tell
+        a walk that continues past a failure from one that abandons the rest of the tree. The
+        rule protection above is what keeps the deny off the parent.
     #>
-    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-deny-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    param([string]$Path)
+    $d = if ($Path) { $Path }
+         else { Join-Path ([IO.Path]::GetTempPath()) ("pm-deny-" + [guid]::NewGuid().ToString('N').Substring(0,8)) }
     New-Item -ItemType Directory -Path $d -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $d 'inside.txt') -Value 'x' -Encoding UTF8
     try {
@@ -1123,6 +1175,63 @@ It 'plex: selects exactly the superseded temps and nothing else' {
         return (($p -join ',') -eq 'index1.bif.tmp,index2.bif.tmp')
     } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
+It 'plex: an unreadable SUBDIRECTORY is recorded AND the rest of the walk still happens' {
+    # The unreadable-ROOT case below cannot see this: with the root unlistable there is nothing
+    # left to walk, so "aborted at the first failure" and "continued past it" look identical.
+    # Here they do not. Get-ChildItem -Recurse -ErrorVariable records one error per unreadable
+    # location and carries on; DirectoryInfo.EnumerateFiles(AllDirectories) throws out of the
+    # whole enumeration at the first one. Under that rewrite this module returns NOTHING and
+    # says 'no superseded .tmp previews' - blindness wearing the word clean.
+    $r = New-PMPlexTree -Pairs 2
+    # The pair BEHIND the failure, in a sibling that sorts after it, is the whole test. Placing
+    # the deny on a leaf with nothing after it proves nothing: .NET yields a directory's own
+    # files BEFORE descending, so an AllDirectories walk would have collected every candidate
+    # already and thrown on its way out, returning the right answer for the wrong reason. This
+    # fixture was built that way first and the mutation survived it.
+    New-Item -ItemType Directory -Path (Join-Path $r 'Localhost\0\zzz-after') -Force | Out-Null
+    foreach ($n in 'index9.bif', 'index9.bif.tmp') {
+        Set-Content -LiteralPath (Join-Path $r "Localhost\0\zzz-after\$n") -Value 'x' -Encoding UTF8
+    }
+    $deny = New-PMUnreadableDir -Path (Join-Path $r 'Localhost\0\locked')
+    if (-not $deny) { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue; return 'SKIP' }
+    try {
+        $o = Invoke-PMModuleTest -ModuleId 'plex-bif-orphans' -RootResolver 'Get-PlexMediaRoot' -FixtureRoot $r
+        $p = @(@($o.Result.Items) | ForEach-Object { Split-Path $_.path -Leaf }) | Sort-Object
+        # Both halves matter. index9 proves the walk resumed past the failure; CriticalReads
+        # proves the failure was not swallowed on the way past.
+        return ((($p -join ',') -eq 'index1.bif.tmp,index2.bif.tmp,index9.bif.tmp') -and ($o.CriticalReads -gt 0))
+    } finally {
+        Remove-PMUnreadableDir $deny
+        Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+It 'plex: does not descend a junction, because a delete through one is out of scope' {
+    # Measured under 5.1: Get-ChildItem -Recurse does NOT enter a junction, and neither does
+    # Remove-Item -Recurse. DirectoryInfo.EnumerateFiles(AllDirectories) DOES - the regression
+    # Get-PMTreeStat's own comment records. A rewrite that reaches for AllDirectories would
+    # start reporting, and then deleting, files that live outside the tree this module scanned.
+    $r = New-PMPlexTree -Pairs 1
+    $behind = Join-Path ([IO.Path]::GetTempPath()) ("pm-plexj-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $behind -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $behind 'behind.bif') -Value 'x' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $behind 'behind.bif.tmp') -Value 'x' -Encoding UTF8
+    $link = Join-Path $r 'Localhost\0\linked'
+    try {
+        $null = cmd /c mklink /J "`"$link`"" "`"$behind`"" 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { return 'SKIP' }   # junctions unavailable here
+        # The pair behind the junction is a textbook orphan, so if it is absent from the result
+        # the ONLY reason can be that the walk declined to enter.
+        $p = @(& $plexPick $r) | Sort-Object
+        return (($p -join ',') -eq 'index1.bif.tmp')
+    } finally {
+        # The junction goes first and by itself: deleting the fixture with the link still in it
+        # removes the link, not the target, but ordering it explicitly keeps the target's
+        # cleanup honest rather than relying on that.
+        cmd /c rmdir "`"$link`"" 2>&1 | Out-Null
+        Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $behind -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # --- stale-app-temp -------------------------------------------------------------------
 function New-PMStaleTree {
@@ -1132,11 +1241,18 @@ function New-PMStaleTree {
     function Add-FixtureFile($p) { Add-FixtureDir (Split-Path $p -Parent); Set-Content -LiteralPath $p -Value 'x' -Encoding UTF8 }
     Add-FixtureFile (Join-Path $root 'Adobe\a.txt')             # exact name, stale
     Add-FixtureFile (Join-Path $root 'occt\b.txt')              # exact name in the wrong case: -contains is case-insensitive
-    Add-FixtureFile (Join-Path $root '7zO1234\c.txt')           # prefix match
+    Add-FixtureFile (Join-Path $root '7zO1234\c.txt')           # prefix match, in the prefix's OWN case
+    # The two entries the prefix rule had no witness for. '7zO1234' matches '7zO' exactly, so
+    # every existing test passed just as happily against an ORDINAL (case-sensitive) compare -
+    # the degenerate-axis problem this project has been bitten by before. '7zo9999' only matches
+    # if the comparison ignores case, and 'pip-unpack-abcd' is the first fixture the second
+    # prefix has ever had, so until now that array element could have been deleted unnoticed.
+    Add-FixtureFile (Join-Path $root '7zo9999\g.txt')           # prefix match in the WRONG case
+    Add-FixtureFile (Join-Path $root 'pip-unpack-abcd\h.txt')   # the second prefix, previously unwitnessed
     Add-FixtureFile (Join-Path $root 'WinGetSomething\d.txt')   # StartsWith a listed NAME but is not one: must be spared
     Add-FixtureFile (Join-Path $root 'RandomApp\e.txt')         # not listed at all
     Add-FixtureFile (Join-Path $root 'CreativeCloud\f.txt')     # exact name, but will be stamped recent
-    foreach ($d in @('Adobe','occt','7zO1234','WinGetSomething','RandomApp')) {
+    foreach ($d in @('Adobe','occt','7zO1234','7zo9999','pip-unpack-abcd','WinGetSomething','RandomApp')) {
         (Get-Item -LiteralPath (Join-Path $root $d)).LastWriteTime = $old
     }
     (Get-Item -LiteralPath (Join-Path $root 'CreativeCloud')).LastWriteTime = (Get-Date)
@@ -1159,6 +1275,24 @@ It 'stale: selects a prefix match' {
     try { return ((& $stalePick $r) -contains '7zO1234') }
     finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
+It 'stale: the prefix list is case-INSENSITIVE, not ordinal' {
+    # StartsWith has three behaviours behind one name and the fixture used to witness none of
+    # them: the one-argument overload is CULTURE-sensitive, [StringComparison]::Ordinal is
+    # case-SENSITIVE, and only OrdinalIgnoreCase is the rule this module means. 7-Zip really
+    # does write both '7zO' and '7zS' cases, so an ordinal compare goes quietly blind to half
+    # of its own scratch.
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -contains '7zo9999') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'stale: the SECOND prefix matches too, not just the first' {
+    # A rewrite that stops at the first array element - the classic break-in-the-wrong-loop -
+    # keeps every other prefix test green. 'pip-unpack-' is the element that proves the loop
+    # visits them all.
+    $r = New-PMStaleTree
+    try { return ((& $stalePick $r) -contains 'pip-unpack-abcd') }
+    finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
 It 'stale: spares a name that merely STARTS WITH a listed name' {
     # The discriminating pair: the names list is exact-match, only the prefixes list is StartsWith.
     # WinGetSomething must survive while 7zO1234 does not.
@@ -1176,11 +1310,14 @@ It 'stale: spares a listed directory that is younger than the floor' {
     try { return ((& $stalePick $r) -notcontains 'CreativeCloud') }
     finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
-It 'stale: selects exactly three things and nothing else' {
+It 'stale: selects exactly five things and nothing else' {
+    # The exhaustiveness assertion, and the reason the two new fixtures had to be added HERE
+    # rather than in a test of their own: a -contains check proves a match happened, only this
+    # one proves nothing ELSE did.
     $r = New-PMStaleTree
     try {
         $p = @(& $stalePick $r) | Sort-Object
-        return (($p -join ',') -eq '7zO1234,Adobe,occt')
+        return (($p -join ',') -eq '7zO1234,7zo9999,Adobe,occt,pip-unpack-abcd')
     } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
@@ -1206,7 +1343,7 @@ It 'stale-app-temp reports Count equal to its Items when under the cap' {
     $r = New-PMStaleTree
     try {
         $o = Invoke-PMModuleTest -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $r
-        return ($o.Result.Count -eq 3 -and @($o.Result.Items).Count -eq 3)
+        return ($o.Result.Count -eq 5 -and @($o.Result.Items).Count -eq 5)
     } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'and caps Items at 25 past it, while Count still carries the truth' {

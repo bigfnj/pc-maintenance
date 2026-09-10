@@ -675,9 +675,9 @@ Timed under 5.1, the version the scheduled task runs.
 
 | Where | Re-measured 2026-09-10 | Fix | Status |
 |---|---|---|---|
-| `stale-app-temp/module.ps1:33` | **1,511 ms -> 33 ms** over 13,088 real Temp names | `foreach` + `break` with an explicit `[StringComparison]::OrdinalIgnoreCase`, instead of a `Where-Object` pipeline per directory | open - **45x**, the biggest confirmed win and the lowest risk. First recorded as 17x |
-| `PMCommon.ps1:484` and `:497` | **565 ms -> 40 ms**, 27.0 MB -> 4.0 MB, over 13,088 dirs | `DirectoryInfo.EnumerateDirectories()`, returning the raw `DirectoryInfo` objects and `.ToArray()` not the `List` | open - **14x**, not the 6.4x first recorded. Wrapping each entry in a `pscustomobject` throws away 80% of the win; keep it NON-recursive or the one-error-per-location equivalence with `-ErrorVariable` dies |
-| `plex-bif-orphans/module.ps1:44-46` | 10,442 ms -> 9,556 ms; **112.7 MB -> 11.8 MB** on a real 47,802-file tree | one streaming `Stack` + `EnumerateFiles` walk, per-directory `try/catch` feeding `Add-PMReadError -Critical`, skipping reparse points | open - the memory win is real and larger than recorded (**9.6x, ~101 MB**); **the 2x time claim does NOT reproduce** - measured ~8%. The tree is 1.28 files per directory, so 37,192 directory opens dominate and the FileInfo materialisation this removes is a small slice |
+| `stale-app-temp/module.ps1:33` | **1,758 ms -> 63 ms** over 17,403 real Temp names, best of three (1,322 -> 48 ms scaled to the 13,088 used before) | `foreach` + `break` with an explicit `[StringComparison]::OrdinalIgnoreCase`, instead of a `Where-Object` pipeline per directory | **DONE 2026-09-10** - **27.8x**, still the biggest win and the lowest risk. The 45x does not reproduce: the "before" lands within 13% of the recorded figure, the "after" is ~45% slower than the 33 ms recorded. First recorded as 17x, then 45x, measured at 28x |
+| `PMCommon.ps1:484` | **685 ms -> 32 ms**, 59.3 MB -> 6.4 MB, over 17,694 real Temp dirs, same name set | `DirectoryInfo.EnumerateDirectories()`, returning the raw `DirectoryInfo` objects and `.ToArray()` not the `List` | **DONE 2026-09-10** - **21x time, 9.2x memory**, better than the 14x recorded. Wrapping each entry in a `pscustomobject` throws away 80% of the win; keep it NON-recursive or the one-error-per-location equivalence with `-ErrorVariable` dies. `:497` (`Get-PMChildFile`) deliberately NOT touched - see below |
+| `plex-bif-orphans/module.ps1:44-46` | warm vs warm on the real 47,802-file / 37,192-directory tree: **9,079 ms -> 8,886 ms** (nil), **131.1 MB -> 14.0 MB** | one streaming `Stack` + `EnumerateFiles` walk, per-directory `try/catch` feeding `Add-PMReadError -Critical`, skipping reparse points | **DONE 2026-09-10, for the memory only** - **9.4x, ~117 MB**, slightly larger than recorded. **There is NO time win at all.** Not the 2x first claimed and not the ~8% re-measured either: across two alternating rounds the two forms interleave (OLD 9,167/9,079 ms, NEW 9,403/8,886 ms), which is noise. The 37,192 directory opens dominate and the FileInfo materialisation this removes is not on the clock. Measured cold-cache-first the old form reads 123,649 ms - that is a measurement artefact of enumeration order, not a win; alternate the two forms or you will record a 13x that is not there |
 | `PMModule.ps1:43` | 27-55 ms x 8 phases | re-dot-sources all of `lib\` per phase; scope isolation is the point | open, low priority |
 | ~~shared Temp listing between `stale-app-temp` and `vs-installer-scratch`~~ | 3 listings per apply run, not 4 (`stale-app-temp` has `AutoApply = $false`, so its Repair is unreachable); **1.0-1.7 s, not 2.26 s** | - | **CLOSED 2026-09-10, not implemented** - see below |
 
@@ -701,20 +701,44 @@ way `Get-ChildItem -ErrorVariable` does. Either mistake silently converts "this 
 blind" into "this module found nothing". Copy the `Stack` + per-directory `try/catch` shape that
 `Get-PMTreeStat` already uses; do not reach for `AllDirectories`.
 
-**Tests that must exist BEFORE those rewrites, because today none of them do.** The plex suite
-has no unreadable-SUBDIRECTORY case and no junction-descent case, so a rewrite using
-`AllDirectories` passes every existing test. `Get-PMChildDirectory` has nothing asserting hidden
-or system directories are still returned, which is the `-Force` semantic an enumerator swap
-silently changes. And `stale-app-temp`'s prefix match is never tested case-insensitively - the
-fixture's `7zO1234` matches `7zO` in exact case and the second prefix `pip-unpack-` has no
-fixture at all, so a rewrite that quietly became ordinal would pass the whole suite. That is the
-degenerate-axis problem this project has already been bitten by once.
+**Tests that had to exist BEFORE those rewrites. WRITTEN FIRST, 2026-09-10, suite 295 -> 301.**
+All six were confirmed green against the UNOPTIMISED code before a line of it moved, then each
+was confirmed to FIRE against the mutation it exists for:
+
+| Test | Mutation it was proved against | Result |
+|---|---|---|
+| `stale: the prefix list is case-INSENSITIVE, not ordinal` (+ `7zo9999` fixture) | `[StringComparison]::Ordinal` | 3 FAIL |
+| `stale: the SECOND prefix matches too` (+ `pip-unpack-abcd` fixture, exhaustiveness now 5 not 3) | as above | included |
+| `Get-PMChildDirectory returns HIDDEN and SYSTEM directories, and only directories` | skip hidden/system entries | 1 FAIL |
+| `Get-PMChildDirectory hands back DirectoryInfo, and an empty result survives @()` | (pins the `List`/`pscustomobject` traps) | - |
+| `plex: an unreadable SUBDIRECTORY is recorded AND the rest of the walk still happens` | `EnumerateFiles(AllDirectories)` | 2 FAIL |
+| `plex: does not descend a junction` | as above | included |
+
+**One of those six was degenerate on its first draft, and the mutation caught it.** The
+unreadable-subdirectory fixture originally put the deny on a LEAF with nothing enumerated after
+it. .NET yields a directory's own files BEFORE descending, so an `AllDirectories` walk had
+already collected every candidate by the time it threw - right answer, wrong reason, mutation
+SURVIVED. The fixture now puts a real orphan pair in a sibling that sorts AFTER the unreadable
+directory, and only then does the mutation fire. Same lesson as the differential-test axes:
+a test against a failure mode has to place the evidence where the failure would eat it.
+
+**`Get-PMChildFile` now has ZERO callers, and was left in place.** `plex-bif-orphans:49` was its
+only one, and the streaming walk above removed it - so the `:497` half of the `PMCommon` row was
+deliberately not optimised: there is nothing left to make faster. Reported rather than deleted,
+because that is a separate decision from this one. Whoever takes it should note the function is
+not dead weight so much as an unused contract: it carries the documented `-Filter` refusal (the
+Win32 8.3 trap that BACKLOG item 1 mutation-tested out of plex) and the `File::Exists` arm, and
+deleting it deletes that record too. If it goes, the `-Filter` warning needs a home.
 
 **Clean, and worth recording so nobody re-checks:** no undisposed resources in this repo - the
 lock stream is disposed on all three exit paths, the one hand-rolled enumerator has a correct
 try/finally, and there are no `Register-ObjectEvent`, runspaces, jobs or CIM sessions anywhere.
 `+=` appears only over bounded collections. The 200-cap read-error accumulator is correct by
-design. The deployed payload hash-matches the repo exactly.
+design. ~~The deployed payload hash-matches the repo exactly.~~ **No longer true, and it was
+already untrue before this item's work started.** The gate's deployment suite failed exactly
+three checks - `Invoke-PcMaintenance.ps1`, `lib` and `modules` differ from `C:\ProgramData` - on
+the UNTOUCHED tree at 295/0, and the same three after each of the three rewrites. Pre-existing
+drift, not caused here, and deliberately not re-deployed as part of this item.
 
 ### 7j-followup. `plex-bif-orphans` still BUILDS a size map nothing reads
 
