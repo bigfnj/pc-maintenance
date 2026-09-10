@@ -1855,6 +1855,51 @@ function Repair-PMModule {
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== size and age must describe the SAME thing a deletion would act on ==" -ForegroundColor Cyan
+It 'a reparse-point root is dated from the LINK, not from the tree behind it' {
+    # BACKLOG 6g. Get-PMPathSize always returned 0 for a junction, because deleting one removes
+    # the link and frees nothing - but the age walk descended it and reported the TARGET's age.
+    # Two readers, same path, different subjects: an idle link over an active target read as
+    # deletable, and an active link over an idle target read as in use.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-6g-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'; $link = Join-Path $base 'link'
+    New-Item -ItemType Directory -Path $real -Force | Out-Null
+    try {
+        # Stamp the TARGET old and leave the LINK new, then assert the age comes back NEW.
+        #
+        # Deliberately no setter on the link. Under 5.1, which is what this suite runs and what
+        # the scheduled task uses, `(Get-Item -LiteralPath $link -Force).LastWriteTimeUtc = $x`
+        # writes THROUGH the junction and stamps the target; under PowerShell 7 the same line
+        # stamps the link. Measured both ways. The production code is unaffected either way
+        # because it reads DirectoryInfo, which always describes the link - but a test built on
+        # that setter passes on 7 and fails on 5.1 for reasons that have nothing to do with the
+        # behaviour under test.
+        Set-Content -LiteralPath (Join-Path $real 'old.txt') -Value 'x' -Encoding UTF8
+        (Get-Item -LiteralPath (Join-Path $real 'old.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-90)
+        $null = cmd /c mklink /J "`"$link`"" "`"$real`"" 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { return 'SKIP' }   # junctions unavailable
+
+        $st = Get-PMTreeStat -Path $link
+        $age = Resolve-PMTreeAge -Stat $st -Path $link
+        # The link was made moments ago, so a correct answer is RECENT. Descending into the
+        # target would report ~90 days and make an in-use link look abandoned.
+        ($st.RootKind -eq 'reparse') -and ($st.Bytes -eq 0) -and
+        (((Get-Date).ToUniversalTime() - $age).TotalDays -lt 1) -and
+        ((Get-PMPathSize -Path $link) -eq 0)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and the target itself is still measured normally when asked directly' {
+    # The guard is about the ROOT being a link, not about refusing to look at real trees.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-6g2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'
+    New-Item -ItemType Directory -Path $real -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $real 'f.bin') -Value ('x' * 400) -Encoding Ascii -NoNewline
+        $st = Get-PMTreeStat -Path $real
+        ($st.RootKind -eq 'dir') -and ($st.Bytes -eq 400)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Write-Host "`n== capping retained read errors must not cap the COUNT ==" -ForegroundColor Cyan
 # The accumulator keeps at most 200 ErrorRecords now, because it used to keep every one in an
 # array grown with += - O(n^2), and 1-3 KB of Exception/InvocationInfo apiece. The danger in

@@ -125,6 +125,17 @@ ran on. The whole report step is wrapped: losing the delivery is a warning, neve
   it exists and you cannot see it, not that registration failed.
 - **When re-testing a scheduled run, wait for the run id to CHANGE.** Waiting for a timestamp to
   look recent will happily read the previous run and report the old behaviour as the new one.
+- **Setting a timestamp on a junction writes through it under 5.1 and to the link under 7.**
+  `(Get-Item -LiteralPath $link -Force).LastWriteTimeUtc = $x` stamps the *target* on Windows
+  PowerShell 5.1 and the *link* on PowerShell 7. Measured both ways. Production code is
+  unaffected because it reads `DirectoryInfo`, which always describes the link — but a test
+  built on that setter passes under 7 and fails under 5.1 for reasons unrelated to what it is
+  testing. Construct such fixtures without stamping the link at all.
+- **`@()` around an EMPTY generic `List` throws "Argument types do not match".** Harmless while
+  a collection is a plain array, and fatal the moment it becomes `List[object]`. Capping the
+  read-error accumulator turned two accessors that did `@($listA) + @($listB)` into eight
+  simultaneous failures, every one of them a caller that only wanted to read an error message.
+  Index the list directly instead.
 
 ## Backlog
 

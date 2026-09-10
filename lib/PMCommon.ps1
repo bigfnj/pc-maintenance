@@ -555,7 +555,22 @@ function Get-PMTreeStat {
 
     try {
         $rootInfo = New-Object System.IO.DirectoryInfo($Path)
-        if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) { $r.RootKind = 'reparse' }
+        if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            # A reparse-point ROOT is not descended, and both numbers describe the LINK.
+            #
+            # This is BACKLOG 6g. Get-PMPathSize always returned 0 here, because deleting a
+            # junction removes the link and frees nothing - but the age walk pushed the root
+            # unconditionally and read the age of the TARGET's whole tree. So the two readers
+            # described different things for the same path: 0 bytes, and an age belonging to a
+            # tree that deletion would not touch. An idle link over an active target read as
+            # deletable; an active link over an idle target read as in use.
+            #
+            # The invariant, now held by construction: size and age must both describe what a
+            # deletion would actually act on. For a link, that is the link.
+            $r.RootKind = 'reparse'
+            $r.NewestUtc = $rootInfo.LastWriteTimeUtc
+            return $r
+        }
     } catch {
         Add-PMReadError -Errors $_ -Critical:$Critical
         $r.RootKind = 'unreadable'; $r.Blind = $true
