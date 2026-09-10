@@ -72,5 +72,14 @@ function Test-PMApplyAllowed {
     param([Parameter(Mandatory)][bool]$Apply, [Parameter(Mandatory)][hashtable]$ModuleInfo)
     if (-not $Apply) { return $false }
     if (-not $ModuleInfo.ContainsKey('AutoApply')) { return $false }
-    return [bool]$ModuleInfo['AutoApply']
+    # Must be a REAL boolean. This was [bool]$ModuleInfo['AutoApply'], which fails OPEN on a type
+    # mistake: Import-PowerShellDataFile preserves the string type, and every non-empty string
+    # casts to $true - so AutoApply = 'false', "False" or "0", written by someone with JSON
+    # habits, silently promoted a module to DELETING. Measured under 5.1: [bool]'false' is True.
+    # `$true -eq $v` is no better, since it coerces the right operand the same way.
+    # An unexpected type reads as false, matching the absent case: a module that does not clearly
+    # say yes has not said yes.
+    $v = $ModuleInfo['AutoApply']
+    if ($v -isnot [bool]) { return $false }
+    return $v
 }

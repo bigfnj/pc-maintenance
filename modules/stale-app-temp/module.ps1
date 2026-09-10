@@ -23,18 +23,22 @@ function Get-StaleAppCandidates {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root = Get-StaleTempRoot -Context $Context
     $cut  = (Get-Date).AddDays(-$script:StaleDays)
-    $out  = @()
+    # List, not +=. The other three modules made this change after measuring it at 13,341
+    # appends: 6,733 ms for += versus 248 ms here, because += reallocates the whole array every
+    # time. This module's allowlist keeps the count small today; the cost of leaving it is that
+    # it is the copy the next module gets cloned from.
+    $out = New-Object 'System.Collections.Generic.List[object]'
     foreach ($d in (Get-PMChildDirectory -Path $root -Critical)) {
         $named    = $script:StaleAppNames -contains $d.Name
         $prefixed = @($script:StaleAppPrefixes | Where-Object { $d.Name.StartsWith($_, 'OrdinalIgnoreCase') }).Count -gt 0
         if (-not ($named -or $prefixed)) { continue }
         if ($d.LastWriteTime -ge $cut) { continue }
-        $out += [pscustomobject]@{
+        $out.Add([pscustomobject]@{
             Path = $d.FullName; Bytes = (Get-PMPathSize -Path $d.FullName)
             AgeDays = [int]((Get-Date) - $d.LastWriteTime).TotalDays
-        }
+        })
     }
-    return $out
+    return $out.ToArray()
 }
 
 function Test-PMModule {
@@ -49,7 +53,13 @@ function Test-PMModule {
         Count  = @($items).Count
         Detail = ('{0} stale app folder(s), oldest {1}d' -f @($items).Count, (@($items | Measure-Object AgeDays -Maximum).Maximum))
         Bytes  = $bytes
-        Items  = @($items | Sort-Object Bytes -Descending | ForEach-Object {
+        # Capped like the other three. This was the ONE uncapped Items in the run JSON, and the
+        # combination that makes that dangerous is specific to this module: its 7zO* and
+        # pip-unpack-* prefixes recur without limit, and AutoApply = $false means it never
+        # deletes them, so its match set only grows. The JSON is written twice per run and kept
+        # 50 runs deep. The true number still travels in Count, and sorting by size descending
+        # means the 25 shown are the 25 worth acting on.
+        Items  = @($items | Sort-Object Bytes -Descending | Select-Object -First 25 | ForEach-Object {
                     @{ path = $_.Path; bytes = $_.Bytes; ageDays = $_.AgeDays } })
     }
 }
@@ -63,18 +73,21 @@ function Repair-PMModule {
     $items = @(Get-StaleAppCandidates -Context $Context)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes: the size was measured during Test, so re-walking the tree here would be a
-        # second full pass for a number we already hold.
+        # KnownBytes saves the walk inside Remove-PMPath. It does NOT carry a size over from
+        # Test: Repair re-derives candidates above, and that measures Bytes inline, so the
+        # number here is microseconds old rather than a phase old. The comment used to claim
+        # the saving was against Test, which was never true. Re-deriving is deliberate - it
+        # re-applies every selection rule at delete time - so only the sizing is waste.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
-        # Reason matters: a path guard VETO is a governance event worth seeing, a file that
-        # vanished between Test and Repair is routine, and a locked file is neither.
-        switch -Wildcard ($r.Reason) {
-            '*refused*' { $vetoed++ }
-            '*outside*' { $vetoed++ }
-            'gone'      { $gone++ }
-            default     { $locked++ }
+        # One shared mapping in PMCommon, not a copy per module. The copies drifted: three of
+        # the four never gained an arm for 'no declared roots supplied', so a guard refusal was
+        # counted as 'locked' and Ok = ($vetoed -eq 0) stayed TRUE.
+        switch (Get-PMRemovalBucket -Reason $r.Reason) {
+            'vetoed' { $vetoed++ }
+            'gone'   { $gone++ }
+            default  { $locked++ }
         }
     }
     # Ok reflects what actually happened. Returning $true unconditionally meant a run in which the

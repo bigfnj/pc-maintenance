@@ -48,10 +48,19 @@ function Get-VsScratchCandidates {
         # Streaming, and it really does stop at the first hit. `@(... | Select-Object -First 1)`
         # did NOT: the @() forces the whole enumeration to finish before the pipeline sees anything.
         $hasVsix = $false
+        $en = $null
         try {
             $en = (New-Object System.IO.DirectoryInfo($d.FullName)).EnumerateFiles('*.vsix', [System.IO.SearchOption]::AllDirectories).GetEnumerator()
             if ($en.MoveNext()) { $hasVsix = $true }
         } catch { Add-PMReadError -Errors $_ }
+        finally {
+            # Calling GetEnumerator() by hand opts out of whatever disposal foreach would have
+            # done, and this is the only place in the repo that does. Without this the find
+            # handle stays open on $d.FullName - the very directory Repair then hands to
+            # Remove-Item -Recurse, where an open handle turns a delete into a delete-pending
+            # and gets miscounted as 'locked'.
+            if ($en -is [IDisposable]) { $en.Dispose() }
+        }
         if (-not $hasVsix) { continue }
         $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'payload-cache'; Bytes = (Get-PMPathSize -Path $d.FullName) })
     }
@@ -84,18 +93,21 @@ function Repair-PMModule {
     $items = @(Get-VsScratchCandidates -Context $Context)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes: the size was measured during Test, so re-walking the tree here would be a
-        # second full pass for a number we already hold.
+        # KnownBytes saves the walk inside Remove-PMPath. It does NOT carry a size over from
+        # Test: Repair re-derives candidates above, and that measures Bytes inline, so the
+        # number here is microseconds old rather than a phase old. The comment used to claim
+        # the saving was against Test, which was never true. Re-deriving is deliberate - it
+        # re-applies every selection rule at delete time - so only the sizing is waste.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
-        # Reason matters: a path guard VETO is a governance event worth seeing, a file that
-        # vanished between Test and Repair is routine, and a locked file is neither.
-        switch -Wildcard ($r.Reason) {
-            '*refused*' { $vetoed++ }
-            '*outside*' { $vetoed++ }
-            'gone'      { $gone++ }
-            default     { $locked++ }
+        # One shared mapping in PMCommon, not a copy per module. The copies drifted: three of
+        # the four never gained an arm for 'no declared roots supplied', so a guard refusal was
+        # counted as 'locked' and Ok = ($vetoed -eq 0) stayed TRUE.
+        switch (Get-PMRemovalBucket -Reason $r.Reason) {
+            'vetoed' { $vetoed++ }
+            'gone'   { $gone++ }
+            default  { $locked++ }
         }
     }
     # Ok reflects what actually happened. Returning $true unconditionally meant a run in which the

@@ -61,14 +61,43 @@ Write-PMLog "=== installing pc-maintenance to $PayloadRoot ===" 'INFO'
 # instead of overwriting it, so a redeploy would otherwise build lib\lib\PMCommon.ps1. Same trap
 # the project this borrows from hit and fixed.
 # One list, shared with the uninstaller's -KeepLogs, so the two cannot drift apart.
+# -PayloadRoot is operator input, this script SELF-ELEVATES, and the loop below recursively
+# force-deletes $PayloadRoot\lib, \modules and two files. The uninstaller has guarded its
+# equivalent since an audit found -PayloadRoot C:\ProgramData would have taken all of
+# ProgramData; the installer never got the same treatment, and 'lib' and 'modules' are very
+# common source-tree names. Same guard, same MinDepth, checked before anything is removed.
+$guardRoot = try { Split-Path -Parent $PayloadRoot } catch { $null }
+if ([string]::IsNullOrWhiteSpace($guardRoot) -or
+    -not (Test-PMPathSafe -Path $PayloadRoot -Roots @($guardRoot) -MinDepth 2)) {
+    Write-PMLog "refusing to install into '$PayloadRoot' - the path guard rejects it" 'ERROR'
+    exit 1
+}
+
 $items = @(Get-PMPayloadItems)
 New-Item -ItemType Directory -Path $PayloadRoot -Force | Out-Null
 foreach ($i in $items) {
     $src = Join-Path $SourceRoot $i
     $dst = Join-Path $PayloadRoot $i
     if (-not (Test-Path -LiteralPath $src)) { Write-PMLog "missing source: $i" 'ERROR'; exit 1 }
-    if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force }
-    Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force
+    # Both were unchecked, with $ErrorActionPreference at its default Continue. A held-open file
+    # under lib\ made Remove-Item fail non-terminating, and Copy-Item -Recurse then nested the
+    # new library at lib\lib\ leaving the OLD lib\*.ps1 in place - after which this script
+    # hardened the ACL, registered the task and printed "install complete", exit 0, while the
+    # weekly SYSTEM task ran stale code indefinitely. The ACL check cannot catch that: the ACL
+    # is fine, the payload is wrong.
+    try {
+        if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction Stop }
+        Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-PMLog "could not deploy '$i': $($_.Exception.Message)" 'ERROR'
+        exit 1
+    }
+    # Prove it landed rather than trusting the copy. Catches the nesting case specifically:
+    # lib\lib\ exists means the delete silently failed.
+    if (-not (Test-Path -LiteralPath $dst)) { Write-PMLog "deploy verification failed: $dst is missing" 'ERROR'; exit 1 }
+    if ((Test-Path -LiteralPath $src -PathType Container) -and (Test-Path -LiteralPath (Join-Path $dst $i))) {
+        Write-PMLog "deploy verification failed: '$i' nested itself at $(Join-Path $dst $i)" 'ERROR'; exit 1
+    }
     Write-PMLog "deployed $i" 'CHANGE'
 }
 New-Item -ItemType Directory -Path (Join-Path $PayloadRoot 'logs') -Force | Out-Null
