@@ -23,28 +23,47 @@ function Get-VsScratchCandidates {
     # because += reallocates the whole array every time.
     $out = New-Object 'System.Collections.Generic.List[object]'
 
-    # Critical: enumerating TEMP is the answer. The per-candidate probes below are NOT - one
-    # locked _MEI directory means that candidate is unknown, not that the sweep is blind.
+    # ONE enumeration of the TEMP root, branched by name, where there used to be two.
+    #
+    # The old shape walked the root twice - once for extractions, once for payload caches -
+    # partitioning the same 11,599 directories by the same regex, at ~335 ms a pass. Worse, the
+    # second pass was NOT marked -Critical, so failing to list the root was recorded as mere
+    # partial coverage in one loop and as blindness in the other, for the same failure. One read,
+    # marked Critical once, is both faster and more honest.
     foreach ($d in (Get-PMChildDirectory -Path $root -Critical)) {
-        if ($d.Name -notmatch '^[a-z0-9]{8}\.[a-z0-9]{3}$') { continue }
+        $isScratchName = $d.Name -match '^[a-z0-9]{8}\.[a-z0-9]{3}$'
         if ($d.LastWriteTime -ge $cut) { continue }
-        # A random name alone is not evidence. Require the installer's own fingerprint, so a
-        # directory that merely looks like scratch survives.
-        if (-not (Test-PMPath -Path (Join-Path $d.FullName 'setup.exe'))) { continue }
-        if (-not (Test-PMPath -Path (Join-Path $d.FullName 'resources\app\ServiceHub'))) { continue }
-        $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'extraction'; Bytes = (Get-PMPathSize -Path $d.FullName) })
-    }
 
-    # The payload cache: one directory of already-applied .vsix / .msi downloads. Identified by
-    # content rather than by its (random, stable) name, so this keeps working when it changes.
-    foreach ($d in (Get-PMChildDirectory -Path $root)) {
-        if ($d.Name -match '^[a-z0-9]{8}\.[a-z0-9]{3}$') { continue }
-        if ($d.LastWriteTime -ge $cut) { continue }
-        # Cheap check FIRST. The manifest probe is one non-recursive listing and eliminates almost
-        # everything; the .vsix probe recurses, so running it first meant walking every unrelated
-        # directory in TEMP (6,194 of them here) on every single run.
-        $manifests = @(Get-PMChildDirectory -Path $d.FullName | Where-Object { $_.Name -match '\.Manifest-|Microsoft\.VisualStudio\.' } | Select-Object -First 1)
-        if (-not $manifests) { continue }
+        if ($isScratchName) {
+            # A random name alone is not evidence. Require the installer's own fingerprint, so a
+            # directory that merely looks like scratch survives.
+            if (-not (Test-PMPath -Path (Join-Path $d.FullName 'setup.exe'))) { continue }
+            if (-not (Test-PMPath -Path (Join-Path $d.FullName 'resources\app\ServiceHub'))) { continue }
+            $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'extraction'; Bytes = (Get-PMPathSize -Path $d.FullName) })
+            continue
+        }
+
+        # The payload cache: one directory of already-applied .vsix / .msi downloads. Identified
+        # by content rather than by its (random, stable) name, so this keeps working when it
+        # changes.
+        #
+        # Native streaming enumeration, breaking on the first match. This probe runs once per
+        # non-scratch directory older than 24h - 6,405 of them here - and it was the single
+        # largest measured cost in the tool: 12,137 ms, twice per apply run, finding nothing.
+        # Get-PMChildDirectory materialises EVERY subdirectory into FileInfo objects before the
+        # pipeline filters them, so the work is proportional to the whole tree rather than to
+        # the first hit. Measured on the same 6,405: 12,137 ms -> 458 ms, same result.
+        #
+        # An mtime horizon was measured first and rejected: 100% of the probe set was written
+        # within a year and 90% within 180 days, so no cutoff short of a dangerous one helps.
+        # A persisted cache of the discovered path was the other option, and is now unnecessary.
+        $hasManifest = $false
+        try {
+            foreach ($sub in [IO.Directory]::EnumerateDirectories($d.FullName)) {
+                if ([IO.Path]::GetFileName($sub) -match '\.Manifest-|Microsoft\.VisualStudio\.') { $hasManifest = $true; break }
+            }
+        } catch { Add-PMReadError -Errors $_ }
+        if (-not $hasManifest) { continue }
         # Streaming, and it really does stop at the first hit. `@(... | Select-Object -First 1)`
         # did NOT: the @() forces the whole enumeration to finish before the pipeline sees anything.
         $hasVsix = $false
