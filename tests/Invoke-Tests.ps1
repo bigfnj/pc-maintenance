@@ -482,9 +482,21 @@ It 'a module needing a user will not act when that user was only inferred' {
 It 'a module needing a user acts when the user is confirmed logged on' {
     Test-PMActingUserConfirmed -RequiresUserSid $true -LoggedIn $true
 }
-It 'a module needing no user is unaffected either way' {
-    (Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $false) -and
-    (Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $true)
+It 'a module NOT needing a user is refused too, when the user was inferred' {
+    # Inverted deliberately (BACKLOG 6i). This asserted the opposite: that omitting
+    # RequiresUserSid made the gate return $true regardless. That made the README's fourth
+    # condition opt-in, and worse, the dispatcher went on expanding that same module's declared
+    # roots against the GUESSED profile - so forgetting the flag bought a stranger's profile
+    # substituted into the roots, which then makes the path guard agree.
+    #
+    # Nobody deletes for a user who was guessed. The flag is still taken so the reason can be
+    # reported accurately; it no longer decides the answer.
+    -not (Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $false)
+}
+It 'and acts normally once that user is confirmed' {
+    # The positive control. Without it, a gate that refused everything would pass the test above
+    # while stopping the tool deleting anything at all.
+    Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $true
 }
 
 Write-Host "`n== the payload must not be writable by a non-admin ==" -ForegroundColor Cyan
@@ -1853,6 +1865,73 @@ function Repair-PMModule {
         return ($j.mode -eq 'apply' -and $j.modules[0].status -eq 'applied' -and
                 [int64]$j.summary.bytes -eq 2000 -and $gone)
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== gates 1-3 are enforced at the deletion primitive, not only upstream (6i) ==" -ForegroundColor Cyan
+# These run OUTSIDE a module phase, so they set the phase stamps by hand - which is exactly what
+# Invoke-PMModulePhase does after dot-sourcing the module.
+function Set-PMPhaseStamp { param($Name, $Apply, $Roots)
+    $script:PMPhaseName = $Name; $script:PMPhaseApply = $Apply; $script:PMPhaseRoots = $Roots }
+function Clear-PMPhaseStamp {
+    $script:PMPhaseName = $null; $script:PMPhaseApply = $null; $script:PMPhaseRoots = $null }
+
+function New-PMGateTree {
+    $b = Join-Path ([IO.Path]::GetTempPath()) ("pm-6i-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $t = Join-Path $b 'victim'
+    New-Item -ItemType Directory -Path $t -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $t 'f.txt') -Value 'x' -Encoding UTF8
+    return @{ Base = $b; Target = $t }
+}
+
+It 'a delete attempted from the TEST phase is refused' {
+    # Nothing stopped a module calling Remove-PMPath from Test-PMModule, where the dispatcher
+    # has not yet decided -Apply, AutoApply or the user gate at all.
+    $g = New-PMGateTree
+    try {
+        Set-PMPhaseStamp -Name 'Test' -Apply $true -Roots @($g.Base)
+        $r = Remove-PMPath -Path $g.Target -Roots @($g.Base) -DeclaredRoots @($g.Base)
+        (-not $r.Removed) -and ($r.Reason -like '*Test phase*') -and (Test-Path -LiteralPath $g.Target)
+    } finally { Clear-PMPhaseStamp; Remove-Item -LiteralPath $g.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a delete in a run that did not grant apply is refused' {
+    $g = New-PMGateTree
+    try {
+        Set-PMPhaseStamp -Name 'Repair' -Apply $false -Roots @($g.Base)
+        $r = Remove-PMPath -Path $g.Target -Roots @($g.Base) -DeclaredRoots @($g.Base)
+        (-not $r.Removed) -and ($r.Reason -like '*did not grant apply*') -and (Test-Path -LiteralPath $g.Target)
+    } finally { Clear-PMPhaseStamp; Remove-Item -LiteralPath $g.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a module cannot WIDEN its declared roots by passing something else' {
+    # The README claimed the dispatcher hands the roots to Remove-PMPath "so the module cannot
+    # influence it". It handed them to the MODULE, which passed them back in - so a module
+    # could substitute @('C:\') and both halves of the guard would be module-supplied. The
+    # authoritative set now wins and the argument is ignored.
+    $g = New-PMGateTree
+    try {
+        # Authoritative roots say somewhere else entirely; the caller claims the real parent.
+        Set-PMPhaseStamp -Name 'Repair' -Apply $true -Roots @('C:\__pm_not_here__')
+        $r = Remove-PMPath -Path $g.Target -Roots @($g.Base) -DeclaredRoots @($g.Base)
+        (-not $r.Removed) -and ($r.Reason -like '*outside*') -and (Test-Path -LiteralPath $g.Target)
+    } finally { Clear-PMPhaseStamp; Remove-Item -LiteralPath $g.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and a legitimate Repair-phase delete still goes through' {
+    # Positive control. Three refusals above prove nothing if the tool can no longer delete.
+    $g = New-PMGateTree
+    try {
+        Set-PMPhaseStamp -Name 'Repair' -Apply $true -Roots @($g.Base)
+        $r = Remove-PMPath -Path $g.Target -Roots @($g.Base) -DeclaredRoots @($g.Base)
+        $r.Removed -and -not (Test-Path -LiteralPath $g.Target)
+    } finally { Clear-PMPhaseStamp; Remove-Item -LiteralPath $g.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and a caller outside any module phase is unaffected' {
+    # Remove-PMPath is called directly by this suite and by the uninstaller. A gate that fired
+    # when no phase had stamped anything would break both without adding any safety.
+    $g = New-PMGateTree
+    try {
+        Clear-PMPhaseStamp
+        $r = Remove-PMPath -Path $g.Target -Roots @($g.Base) -DeclaredRoots @($g.Base)
+        $r.Removed
+    } finally { Clear-PMPhaseStamp; Remove-Item -LiteralPath $g.Base -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host "`n== 8.3 short names must not slip past the forbidden list (BACKLOG 6k) ==" -ForegroundColor Cyan

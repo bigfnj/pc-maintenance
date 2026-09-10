@@ -79,12 +79,27 @@ would delete in-flight work from any session outliving the floor.
 forbidden *path* set, because what this tool can get wrong is measured in deleted bytes.
 
 Two conditions, and the second one is the point: the target must sit under a root **declared in
-the module's own `module.psd1`**, which the dispatcher expands and hands to `Remove-PMPath` so the
-module cannot influence it, **and** it must match no forbidden pattern at three or more segments
-deep. A module supplying its own root would be self-certification, which is what this was until an
-audit noticed the declared roots were never actually read. It fails closed: no resolvable declared
-roots means no deletion at all. Docker volume roots are refused by name, because from the outside
-one looks exactly like disposable scratch while holding an application's only copy of its data.
+the module's own `module.psd1`**, **and** it must match no forbidden pattern at two or more
+directories deep, the drive excluded. A module supplying its own root would be self-certification,
+which is what this was until an audit noticed the declared roots were never actually read. It
+fails closed: no resolvable declared roots means no deletion at all. Docker volume roots are
+refused by name, because from the outside one looks exactly like disposable scratch while holding
+an application's only copy of its data. Short names are resolved first, since every pattern here
+matches on a name and `PROGRA~1` would otherwise walk past all of them.
+
+**The declared roots are the dispatcher's, not the module's.** It expands them and stamps them
+onto the phase, and `Remove-PMPath` reads that stamp rather than the argument it was handed - so
+a module cannot widen its own reach by passing something broader. It used to be able to: the
+dispatcher put the roots on a context hashtable, the module read them off and passed them back
+in, so *both* halves of the guard arrived module-supplied. `Remove-PMPath` also refuses outright
+during the `Test` phase, and on a run that never granted `-Apply`, so the first three conditions
+are enforced where the deletion happens rather than only in the dispatcher's control flow.
+
+Worth being exact about what that is and is not. A dot-sourced child scope is not a security
+boundary, and a module determined to subvert this can still reach the same variables. What it
+buys is that the safe path is the **default** one: no module widens its roots or deletes in the
+wrong phase by accident, by copying a bad example, or by getting a parameter wrong. Deliberate
+subversion is a different threat, already answered by the payload ACL.
 
 **The payload must not be writable by a non-admin.** The dispatcher dot-sources every `.ps1` under
 `lib/` and the task runs as SYSTEM, so a payload directory a standard user can write to is

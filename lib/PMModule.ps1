@@ -42,6 +42,27 @@ function Invoke-PMModulePhase {
         param($libDir, $entry, $ctx, $phase)
         Get-ChildItem $libDir -Filter *.ps1 -ErrorAction Stop | ForEach-Object { . $_.FullName }
         . $entry
+
+        # Stamp what the DISPATCHER decided, AFTER the module has been dot-sourced so its
+        # top-level code cannot pre-seed these, and read directly by Remove-PMPath.
+        #
+        # This is BACKLOG 6i-2 and 6i-3. The README said the dispatcher "hands the declared
+        # roots to Remove-PMPath so the module cannot influence it" - but the dispatcher handed
+        # them to the MODULE, which passed them on, so both halves of the path guard arrived
+        # module-supplied. And Remove-PMPath knew nothing about -Apply or the phase, so nothing
+        # stopped a module deleting from Test-PMModule, where the dispatcher has not yet decided
+        # anything.
+        #
+        # Being honest about what this is: a dot-sourced child scope is not a security boundary,
+        # and a module determined to subvert this can still assign to these variables. What it
+        # buys is that the safe path is now the DEFAULT one - a module cannot widen its roots or
+        # delete in the wrong phase by accident, by copying the wrong example, or by getting a
+        # parameter wrong. Deliberate subversion is a different threat, and the module payload
+        # is already ACL-protected against anyone who is not an administrator.
+        $script:PMPhaseName  = $phase
+        $script:PMPhaseApply = [bool]$ctx.Apply
+        $script:PMPhaseRoots = @($ctx.DeclaredRoots)
+
         Clear-PMReadErrors
         $result = switch ($phase) {
             'Test' { Test-PMModule -Context $ctx }

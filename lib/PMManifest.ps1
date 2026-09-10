@@ -54,10 +54,22 @@ function Test-PMActingUserConfirmed {
         wrong number is visible and harmless - and not fine for removal, which on a multi-profile
         machine with nobody signed in would delete inside a stranger's Temp.
 
-        A module that needs no user at all is unaffected.
+        UNCONDITIONAL, which it was not. This used to return $true immediately for a module
+        that omitted RequiresUserSid - while the dispatcher went on expanding that same module's
+        declared roots against the INFERRED profile and handing it to Repair. So a module that
+        simply forgot the flag got a guessed stranger's profile substituted into its roots, which
+        makes the path guard agree, and the README's fourth condition was quietly opt-in.
+
+        Now: nobody deletes for a user who was guessed. $RequiresUserSid is still taken so the
+        reason can be reported accurately, but it no longer decides the answer.
+
+        The cost is a module that genuinely needs no user - one sweeping ProgramData, say -
+        being held to report-only at the logon screen when nobody is signed in. That is the
+        conservative direction and it costs a week's delay on a cleanup, against the alternative
+        of deleting inside the wrong profile. All four shipped modules declare the flag, so this
+        changes nothing for any of them today.
     #>
     param([Parameter(Mandatory)][bool]$RequiresUserSid, [Parameter(Mandatory)][bool]$LoggedIn)
-    if (-not $RequiresUserSid) { return $true }
     return $LoggedIn
 }
 

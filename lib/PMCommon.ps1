@@ -834,11 +834,40 @@ function Remove-PMPath {
     if (-not (Test-PMPathSafe -Path $Path -Roots $Roots -MinDepth $MinDepth)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'refused by path guard'; Bytes = [int64]0 }
     }
+    # Gates 1-3, enforced HERE and not only in the dispatcher.
+    #
+    # Remove-PMPath used to know nothing about -Apply or which phase it was in, so the README's
+    # first three conditions existed entirely in the dispatcher's control flow. Nothing stopped a
+    # module calling this from Test-PMModule, before any of them had been evaluated.
+    #
+    # Only enforced when the phase actually stamped these - Remove-PMPath is called directly by
+    # the suite too, and a guard that fires outside a module phase would break every one of
+    # those without adding safety.
+    if ($null -ne $script:PMPhaseName -and -not $WhatIfOnly) {
+        if ($script:PMPhaseName -eq 'Test') {
+            return @{ Removed = $false; Skipped = $true; Bytes = [int64]0
+                      Reason = 'refused: deletion attempted from the Test phase' }
+        }
+        if (-not $script:PMPhaseApply) {
+            return @{ Removed = $false; Skipped = $true; Bytes = [int64]0
+                      Reason = 'refused: this run did not grant apply' }
+        }
+    }
+
     # The SECOND, independent condition. $Roots above is supplied by the module at run time, so on
     # its own it is self-certification: a module that computes the wrong root gets to delete there.
-    # $DeclaredRoots comes from module.psd1 via the dispatcher and the module cannot influence it.
+    # $DeclaredRoots comes from module.psd1 via the dispatcher.
+    #
+    # And when the phase stamped the authoritative set, THAT is what is used - the caller's
+    # argument is ignored rather than trusted. Previously the dispatcher put the roots on the
+    # context, the module read them off and passed them back in, so a module could widen them
+    # to @('C:\') just by passing something else, and $Context is a hashtable shared by
+    # reference across both phases so Test could even mutate them for Repair.
     # Fail CLOSED. Reading this as "no declared roots means no restriction" would make the
     # independent half of the guard vanish exactly when a caller forgot to supply it.
+    if ($null -ne $script:PMPhaseRoots -and @($script:PMPhaseRoots).Count) {
+        $DeclaredRoots = @($script:PMPhaseRoots)
+    }
     if (-not @($DeclaredRoots).Count) {
         return @{ Removed = $false; Skipped = $true; Reason = 'no declared roots supplied'; Bytes = [int64]0 }
     }

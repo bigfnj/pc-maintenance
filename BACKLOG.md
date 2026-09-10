@@ -334,7 +334,7 @@ expands to exactly what it counted. What is overstated is the README's "the two 
 disagree": both derive from one object, but they derive *different things* under one label. The
 honest fix is naming, not logic, and it should not change the JSON schema.
 
-### 6i. Guarantees the README states more strongly than the code provides
+### 6i. ~~Guarantees the README states more strongly than the code provides~~ DONE 2026-09-10
 
 Three, all currently unreachable through the four shipped modules, all worth closing the gap
 between prose and behaviour rather than softening the prose:
@@ -351,6 +351,38 @@ between prose and behaviour rather than softening the prose:
 - **`Remove-PMPath` enforces only gate 4.** It knows nothing about `-Apply` or `AutoApply`, and
   nothing stops a module calling it from `Test-PMModule`. Gates 1-3 live entirely in the
   dispatcher.
+
+### 6i closed by tightening the code, not the prose
+
+All three were the same shape: a gate living in the dispatcher's control flow while the README
+described it as a property of the deletion itself. Moved to the primitive.
+
+- **Gate 3 is now unconditional.** `Test-PMActingUserConfirmed` returned `$true` immediately for
+  a module that omitted `RequiresUserSid` - while the dispatcher went on expanding that same
+  module's declared roots against the INFERRED profile. Forgetting the flag therefore bought a
+  guessed stranger's profile substituted into the roots, which is what then makes the path guard
+  agree. Nobody deletes for a guessed user now. It costs a module that genuinely needs no user
+  its sweep at the logon screen; all four shipped modules declare the flag, so nothing changes
+  today.
+- **Declared roots belong to the dispatcher again.** `Invoke-PMModulePhase` stamps them onto the
+  phase after dot-sourcing the module, and `Remove-PMPath` reads that stamp instead of its own
+  argument - so passing `@('C:\')` widens nothing. Previously the dispatcher put them on a
+  context hashtable, the module read them off and passed them back, so both halves of the guard
+  arrived module-supplied - and `$Context` is shared by reference across phases, so `Test` could
+  even mutate them for `Repair`.
+- **`Remove-PMPath` refuses in the Test phase, and on a run without `-Apply`.** Nothing
+  previously stopped a module deleting from `Test-PMModule`, before any gate had been evaluated.
+
+**Honest about the boundary.** A dot-sourced child scope is not one, and a module determined to
+subvert this can still assign to the same variables. What changed is that the safe path is the
+DEFAULT: no module widens its roots or deletes in the wrong phase by accident, by copying a bad
+example, or by getting a parameter wrong. Deliberate subversion is a different threat, already
+answered by the payload ACL.
+
+Five tests, two of them positive controls - three refusals prove nothing if the tool can no
+longer delete, and a gate firing outside a module phase would break both this suite and the
+uninstaller while adding no safety. One existing test had to be INVERTED, which is the honest
+marker that this was a behaviour change and not a tidy-up.
 
 ### 6j. ~~`Test-PMPayloadSecure` has three gaps in the check the README calls load-bearing~~ DONE
 
