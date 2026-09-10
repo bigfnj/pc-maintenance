@@ -1462,6 +1462,28 @@ try {
     It 'and it is escaped like any other text the report did not author' {
         ($whyHtml -match 'cache &lt;&amp;&gt;') -and ($whyHtml -notmatch 'cache <&>')
     }
+    It 'a SKIPPED module still explains itself' {
+        # The prose was gathered after two `continue`s, so a module skipped for a forbidden
+        # category - or for needing an interactive user when none resolved - got a card with no
+        # "why" section beside cards that had one, reading as though it had nothing to say. The
+        # skipped cases are exactly where a reader asks what the module WOULD have done.
+        $skipRun = [ordered]@{
+            runId = 'skip-run'; startedUtc = (Get-Date).ToUniversalTime().ToString('o')
+            version = '0.0.0'; mode = 'report'
+            modules = @([ordered]@{ id = 'mod-skipped'; status = 'skipped'
+                                    detail = "category 'x' not permitted"; bytes = [int64]0
+                                    count = 0; items = @() })
+            summary = [ordered]@{ total = 1; clean = 0; found = 0; applied = 0; skipped = 1
+                                  unverified = 0; partial = 0; errors = 0; bytes = [int64]0 }
+            exitCode = 0
+        }
+        $o = Join-Path ([IO.Path]::GetTempPath()) ("pm-skip-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".html")
+        try {
+            $null = New-PMHtmlReport -Run $skipRun -OutPath $o `
+                -ModuleDoc @{ 'mod-skipped' = @{ Description = 'd'; Details = 'why it would have acted' } }
+            (Get-Content -LiteralPath $o -Raw) -match 'why it would have acted'
+        } finally { Remove-Item -LiteralPath $o -Force -ErrorAction SilentlyContinue }
+    }
     It 'a module with no prose gets no empty disclosure' {
         # mod-clean was not given any. Rendering a "why" with nothing under it would be worse
         # than omitting it.

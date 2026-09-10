@@ -144,6 +144,17 @@ try {
         try {
             $info = Import-PMModuleInfo -ModuleDir $modDir
 
+            # Recorded HERE, before any of the `continue`s below, because a SKIPPED module
+            # still gets a card in the report - and a card with no "why" section beside cards
+            # that have one reads as though that module has nothing to say for itself. The
+            # skipped cases are exactly where a reader is most likely to ask what the module
+            # would have done.
+            #
+            # Kept out of $row, and so out of the run JSON, deliberately: see -ModuleDoc on
+            # New-PMHtmlReport.
+            $moduleDoc[$modId] = @{ Description = [string]$info['Description']
+                                    Details     = [string]$info['Details'] }
+
             if (-not (Test-PMCategoryAllowed -Category $info.Category -Manifest $manifest)) {
                 $row.status = 'skipped'; $row.detail = "category '$($info.Category)' not permitted"
                 Write-PMLog "$modId SKIP - $($row.detail)" 'SKIP'; $summary.skipped++; $results += $row; continue
@@ -162,11 +173,6 @@ try {
             # reports LoggedIn=$false. That is fine for reporting - a wrong number is visible and
             # harmless - and not fine for removal, which on a multi-profile machine with nobody
             # signed in would delete inside a stranger's Temp.
-            # Static prose for the report, gathered where the psd1 is already in hand. Kept
-            # out of $row - and so out of the run JSON - deliberately; see -ModuleDoc on
-            # New-PMHtmlReport.
-            $moduleDoc[$modId] = @{ Description = [string]$info['Description']
-                                    Details     = [string]$info['Details'] }
             $needsUser = [bool]$info['RequiresUserSid']
             if ($mayApply -and -not (Test-PMActingUserConfirmed -RequiresUserSid $needsUser -LoggedIn ([bool]$user.LoggedIn))) {
                 $mayApply = $false
