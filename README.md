@@ -134,9 +134,32 @@ Non-destructive, no Pester dependency. Run it under **Windows PowerShell 5.1**, 
 because 5.1 is what the scheduled task runs; the suite parses every script under 5.1 for that
 reason, and says so loudly if you run it under 7.
 
-205 tests elevated, 204 plus one honest SKIP otherwise. A skip is counted and printed separately
-rather than folded into the pass total: a check that reports success while verifying nothing is
-the exact failure this project exists to catch, so the suite must not commit it either.
+The suite prints its own totals and this paragraph deliberately does not repeat them. A count in
+prose is stale the day a test is added - it had drifted by more than a hundred before anyone
+noticed, and `Install-PcMaintenance.ps1` had already learned the same lesson about naming a module
+count in its help. New `.ps1` files are picked up automatically: the parse check globs the tree, so
+adding a script adds a test.
+
+One check SKIPs without elevation, because it needs to set an ACL. A skip is counted and printed
+separately rather than folded into the pass total: a check that reports success while verifying
+nothing is the exact failure this project exists to catch, so the suite must not commit it either.
+
+### Smoking the installation, not the code
+
+```powershell
+.\tests\Invoke-DeploymentSmoke.ps1            # what it can check unprivileged
+.\tests\Invoke-DeploymentSmoke.ps1 -Elevate   # one UAC prompt, then everything
+```
+
+`Invoke-Tests.ps1` verifies this repository. The payload under `ProgramData` is a *copy* made at
+install time, and it is the copy the weekly SYSTEM task runs - so a green suite says nothing about
+what is actually deployed. This checks the other half: that every deployed file still hashes to
+its repo original, that the payload ACL refuses a real non-admin write rather than merely looking
+right, that the task is registered against *this* payload root, that the dispatcher runs and
+advances its run id, and that the delivered HTML is self-contained and escaped.
+
+That gap was not hypothetical. A batch of safety fixes sat committed and green while the deployed
+copy still carried the bug they fixed, in the one module that has `AutoApply`.
 
 Open work and the order I would do it in: [BACKLOG.md](BACKLOG.md).
 
