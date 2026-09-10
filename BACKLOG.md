@@ -141,19 +141,49 @@ close it; closing it properly means deleting by handle opened with `FILE_FLAG_OP
 
 ---
 
-## Smaller, and genuinely optional
+## 5. ~~The five smaller items~~ DONE 2026-09-09
 
-- `Format-PMBytes` renders anything under 512 bytes as `0 KB` and has no TB tier, so a 2 TB sweep
-  would print `2048.00 GB`.
-- Log retention omits `-File`, so a subdirectory under `logs\` would match; `-Force` without
-  `-Recurse` then fails silently. It also deletes outside the path guard.
-- `Get-PMInteractiveUserSid`'s header comment says no user is guessed. Its third fallback does
-  guess, in arbitrary registry order. Deletion is correctly blocked for an inferred user now, but
-  **the comment is still wrong** and reporting does run against whichever profile it picked.
-- `Get-PMForbiddenPathPatterns` and `Get-PMForbiddenCategories` are defined and never called. They
-  are exactly the accessors a test would need to assert the two hard-coded lists have not been
-  quietly edited, so their deadness marks a missing test rather than dead weight to remove.
-- `-KeepLogs` on the uninstaller is a silent no-op unless `-RemoveFiles` is also passed.
+All five shipped, each mutation-tested. Kept here rather than deleted because two of them turned
+out to be worth more than their size suggested.
+
+- **`Format-PMBytes`** gained a bytes tier and a TB tier. Under 512 B it printed `0 KB`, which in
+  a report is indistinguishable from a module that found nothing, and 2 TB printed
+  `2,048.00 GB`. It had no tests at all; it now has ten.
+- **Log retention** became `Remove-PMOldLogs`, fenced the same way `Remove-PMOldReports` is,
+  because both delete outside the path guard. The three inline pipelines omitted `-File`, so a
+  directory under `logs\` matched and `Remove-Item -Force` without `-Recurse` then failed
+  silently under `-EA SilentlyContinue` - a no-op that read, in the transcript, exactly like
+  retention working. The age sweep had no name filter at all. `MaxAgeDays = 0` now means **no**
+  age sweep rather than being floored to 1, because flooring it would read as safety and behave
+  as "delete everything older than yesterday".
+- **`Get-PMInteractiveUserSid`'s comment** now matches its code, the object carries `Inferred`,
+  the run record carries `interactiveUser`, and the report prints an INFERRED USER notice. The
+  deletion gate was always right; only the description was wrong. Testing this needed a trick
+  worth keeping: PowerShell resolves commands through the **caller's** scope chain and puts
+  functions ahead of cmdlets, so defining `function Get-CimInstance { throw }` inside the test
+  body forces the resolver past both observation sources and down to the registry fallback.
+  Without that, the confirmed branch is the only one a test on this machine could ever reach.
+- **The two dead accessors** were not deleted, they were used. Both hard-coded lists are now
+  pinned by joined comparison, so order is pinned too. The per-pattern tests catch a pattern that
+  stops **working**; these catch one that quietly stops **existing**.
+- **`-KeepLogs`** works and says what it did. The removal moved into `Remove-PMPayloadFiles` so it
+  can be tested against a fixture without elevating or unregistering the real task, and the
+  deployed-item list moved into one place shared with the installer.
+
+⚠ **And the one that was not on the list.** Writing the test for the uninstaller's guard found a
+real hole. `MinDepth` counted the DRIVE LETTER as a segment, so `MinDepth 2` meant "drive plus one
+directory" and
+
+```
+Uninstall-PcMaintenance.ps1 -PayloadRoot C:\ProgramData -RemoveFiles
+```
+
+passed the guard. `-PayloadRoot` is the only operator-supplied path in the project and the only
+caller not handed an enumerated `.FullName`, which is exactly why it carries a guard at all.
+`MinDepth` now counts directories with the drive excluded and the default moved 3 -> 2 in the same
+change, so every module caller counts the same segments it did before and only the uninstaller
+gets stricter. This is the fifth time on this project that writing a test for something small
+found something that was not small.
 
 ## Decisions worth revisiting later, not bugs
 
