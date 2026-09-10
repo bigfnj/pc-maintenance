@@ -53,13 +53,24 @@ function Get-AgentScratchCandidates {
     $cutUtc = (Get-Date).ToUniversalTime().AddDays(-$script:AgentIdleDays)
     $out = New-Object 'System.Collections.Generic.List[object]'
     foreach ($s in (Get-AgentSessionDirectory -Root $root)) {
-        # Stops walking the moment it finds anything newer than the cutoff, so an active session
-        # costs one file read and only genuinely idle ones are walked in full.
-        $newest = Get-PMNewestWriteUtc -Path $s.FullName -NewerThanUtc $cutUtc
+        # ONE walk for both answers. Stops the moment it finds anything newer than the cutoff, so
+        # an active session costs one file read and only genuinely idle ones are walked in full.
+        #
+        # This used to call Get-PMNewestWriteUtc and then Get-PMPathSize, which are the same
+        # traversal - and because a session only becomes a candidate by being IDLE, the age walk
+        # never took its early exit for exactly the paths whose size was then wanted. Every
+        # selected candidate was therefore walked twice, in full. At the measured peak of 933
+        # idle sessions over 3.2 GB that is a whole redundant pass over the selected set.
+        $stat = Get-PMTreeStat -Path $s.FullName -NewerThanUtc $cutUtc
+        $newest = Resolve-PMTreeAge -Stat $stat -Path $s.FullName
         if ($newest -gt $cutUtc) { continue }
+        # Complete is true here by construction: an early exit means it beat the cutoff, and that
+        # path just took the `continue` above. Asserted rather than assumed, because reading a
+        # partial Bytes would under-report what a deletion frees.
+        $bytes = if ($stat.Complete -and $stat.RootKind -eq 'dir') { [int64]$stat.Bytes } else { Get-PMPathSize -Path $s.FullName }
         $out.Add([pscustomobject]@{
             Path     = $s.FullName
-            Bytes    = (Get-PMPathSize -Path $s.FullName)
+            Bytes    = $bytes
             Project  = (Split-Path (Split-Path $s.FullName -Parent) -Leaf)
             IdleDays = [int]((Get-Date).ToUniversalTime() - $newest).TotalDays
         })

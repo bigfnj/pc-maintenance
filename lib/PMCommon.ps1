@@ -413,59 +413,126 @@ function Test-PMPath { param([Parameter(Mandatory)][AllowEmptyString()][string]$
     Test-Path -LiteralPath $Path
 }
 
-function Get-PMPathSize {
+function Get-PMTreeStat {
     <#
+        ONE traversal that answers both questions a module asks about a directory: how big is it
+        and when was anything in it last written.
+
+        These were two functions with byte-for-byte identical walks - same Stack[string], same
+        EnumerateFiles/EnumerateDirectories, same reparse-point skip. agent-scratchpads called
+        both on every candidate, and because a candidate only becomes a candidate by being IDLE,
+        the age walk never took its early exit for exactly the paths whose size was then wanted.
+        So every selected candidate was walked twice, in full, for data one pass already had.
+
+        Deliberately returns FACTS, not decisions. The root policies of the two callers genuinely
+        differ - Get-PMPathSize returns 0 for a reparse-point root because deletion frees nothing
+        there, while Get-PMNewestWriteUtc has never checked its root at all (BACKLOG 6g) - so
+        folding that policy in here would silently change one of them. The wrappers keep their own.
+
         Reads .Length off the enumeration's own WIN32_FIND_DATA rather than re-stat'ing every
         file: measured 25 ms against 78 ms for Get-ChildItem -Recurse | Measure-Object on a real
-        868-file directory. At 13,341 directories that is ~6 minutes instead of ~17.
+        868-file directory.
 
-        It walks directories ITSELF instead of using AllDirectories, for a correctness reason that
+        Walks directories ITSELF instead of using AllDirectories, for a correctness reason that
         cost a regression to learn: DirectoryInfo.EnumerateFiles(AllDirectories) FOLLOWS reparse
-        points, while Get-ChildItem -Recurse and Remove-Item -Recurse do not. Using it meant a
-        junction in TEMP had its target's whole tree counted, so the report's headline figure and
-        the "removed N GB" line were inflated by a tree that was never enumerated and never
-        deleted. Size must measure the same bytes deletion will actually free.
+        points, while Get-ChildItem -Recurse and Remove-Item -Recurse do not. Size must measure
+        the same bytes deletion will actually free.
 
-        It also RECORDS what it could not read. It used to be the one reader that swallowed access
-        errors, which is the exact "silence looks like emptiness" failure the rest of this file
-        exists to prevent.
+        -NewerThanUtc stops the walk the moment anything beats the cutoff. That is what keeps the
+        age question cheap - an active directory exits after one file - but it leaves Bytes
+        PARTIAL, so Complete comes back false and callers must not read Bytes when it is.
+
+        Returns @{ Bytes; NewestUtc; Blind; Complete; RootKind; RootLength }
+          Blind    - at least one read failed, so neither number covers the whole tree
+          Complete - the walk finished; false means it early-exited and Bytes is meaningless
+          RootKind - 'file' | 'reparse' | 'dir' | 'missing' | 'unreadable'
     #>
-    param([Parameter(Mandatory)][string]$Path, [switch]$Critical)
-    if (-not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [datetime]$NewerThanUtc = [datetime]::MinValue,
+        [switch]$Critical
+    )
+    $r = @{ Bytes = [int64]0; NewestUtc = [datetime]::MinValue; Blind = $false
+            Complete = $true; RootKind = 'dir'; RootLength = [int64]0 }
 
-    # A file is a legitimate thing to ask the size of - plex hands us individual .tmp files.
-    # DirectoryInfo on a file used to throw into the catch and report 0 bytes plus a bogus read
-    # error, which on a -Critical path would flip the whole module to unverified.
-    try {
-        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
-        if (-not ($item.Attributes -band [IO.FileAttributes]::Directory)) { return [int64]$item.Length }
-        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return [int64]0 }
-    } catch {
-        Add-PMReadError -Errors $_ -Critical:$Critical
-        return [int64]0
+    if (-not [IO.Directory]::Exists($Path)) {
+        if ([IO.File]::Exists($Path)) {
+            # A file is a legitimate thing to ask about - plex hands us individual .tmp files.
+            try {
+                $fi = New-Object System.IO.FileInfo($Path)
+                $r.RootKind = 'file'; $r.RootLength = [int64]$fi.Length
+                $r.Bytes = [int64]$fi.Length; $r.NewestUtc = $fi.LastWriteTimeUtc
+            } catch {
+                Add-PMReadError -Errors $_ -Critical:$Critical
+                $r.RootKind = 'unreadable'; $r.Blind = $true
+            }
+            return $r
+        }
+        $r.RootKind = 'missing'
+        return $r
     }
 
-    $total = [int64]0
+    try {
+        $rootInfo = New-Object System.IO.DirectoryInfo($Path)
+        if ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) { $r.RootKind = 'reparse' }
+    } catch {
+        Add-PMReadError -Errors $_ -Critical:$Critical
+        $r.RootKind = 'unreadable'; $r.Blind = $true
+        return $r
+    }
+
+    $canExitEarly = ($NewerThanUtc -gt [datetime]::MinValue)
     $stack = New-Object 'System.Collections.Generic.Stack[string]'
     $stack.Push($Path)
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
         try {
             $di = New-Object System.IO.DirectoryInfo($dir)
-            foreach ($f in $di.EnumerateFiles()) { $total += [int64]$f.Length }
+            foreach ($f in $di.EnumerateFiles()) {
+                $r.Bytes += [int64]$f.Length
+                if ($f.LastWriteTimeUtc -gt $r.NewestUtc) { $r.NewestUtc = $f.LastWriteTimeUtc }
+                # Safe to leave without consulting Blind: something in here is newer than the
+                # cutoff, so the answer is "active", which is the sparing answer either way.
+                if ($canExitEarly -and $r.NewestUtc -gt $NewerThanUtc) { $r.Complete = $false; return $r }
+            }
             foreach ($sub in $di.EnumerateDirectories()) {
                 # Do not descend a junction or symlink: neither will the deletion.
                 if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
                 $stack.Push($sub.FullName)
             }
         } catch {
-            # One unreadable subtree must not abandon the rest of the count, and must not pass
-            # silently either. Continue rather than break, so the number is as complete as it can
-            # be and the caller still learns it is incomplete.
+            # One unreadable subtree must not abandon the rest, and must not pass silently
+            # either. Continue so the numbers are as complete as they can be, and flag Blind so
+            # the caller learns they are incomplete.
             Add-PMReadError -Errors $_ -Critical:$Critical
+            $r.Blind = $true
         }
     }
-    return $total
+    return $r
+}
+
+function Get-PMPathSize {
+    <#
+        Total bytes under $Path, measuring what a deletion would actually free.
+
+        A reparse-point root frees nothing when removed - Remove-Item deletes the link, not the
+        target - so it returns 0 rather than the target's size. Getting that wrong once inflated
+        both the report headline and the "removed N GB" line by a tree that was never enumerated
+        and never deleted.
+
+        Errors are RECORDED, not swallowed. This used to be the one reader that hid access
+        failures, which is the exact "silence looks like emptiness" failure the rest of this file
+        exists to prevent.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$Critical)
+    $st = Get-PMTreeStat -Path $Path -Critical:$Critical
+    switch ($st.RootKind) {
+        'file'       { return [int64]$st.RootLength }
+        'reparse'    { return [int64]0 }
+        'missing'    { return [int64]0 }
+        'unreadable' { return [int64]0 }
+    }
+    return [int64]$st.Bytes
 }
 
 function Get-PMNewestWriteUtc {
@@ -490,35 +557,19 @@ function Get-PMNewestWriteUtc {
         [datetime]$NewerThanUtc = [datetime]::MinValue,
         [switch]$Critical
     )
-    $newest = [datetime]::MinValue
-    $blind  = $false        # did ANY read fail? see the end of the function for why it decides the answer
-    # The early exit below only means anything when the caller gave us a cutoff to beat. With the
-    # default MinValue EVERY file beats it, so this returned after the first file it happened to
-    # enumerate - not the newest, which is the one thing the function is named for. Production
-    # always passes a cutoff, so only callers that omitted it were getting the wrong answer.
-    $canExitEarly = ($NewerThanUtc -gt [datetime]::MinValue)
-    $stack = New-Object 'System.Collections.Generic.Stack[string]'
-    $stack.Push($Path)
-    while ($stack.Count -gt 0) {
-        $dir = $stack.Pop()
-        try {
-            $di = New-Object System.IO.DirectoryInfo($dir)
-            foreach ($f in $di.EnumerateFiles()) {
-                if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
-                # Safe to leave without the $blind check: we already know something in here is
-                # newer than the cutoff, so the answer is "active", which is the sparing answer.
-                if ($canExitEarly -and $newest -gt $NewerThanUtc) { return $newest }
-            }
-            foreach ($sub in $di.EnumerateDirectories()) {
-                if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-                $stack.Push($sub.FullName)
-            }
-        } catch {
-            Add-PMReadError -Errors $_ -Critical:$Critical
-            $blind = $true
-        }
-    }
-    if ($blind) {
+    $st = Get-PMTreeStat -Path $Path -NewerThanUtc $NewerThanUtc -Critical:$Critical
+    return (Resolve-PMTreeAge -Stat $st -Path $Path)
+}
+
+function Resolve-PMTreeAge {
+    <#
+        Turn a Get-PMTreeStat result into the age answer, with the two not-knowing cases kept
+        distinct. Shared so a caller that already has a Stat does not have to re-derive - and
+        cannot get it subtly different.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Stat, [Parameter(Mandatory)][string]$Path)
+
+    if ($Stat.Blind) {
         # We could not read all of it, so we do not KNOW its age, and the two ways of not knowing
         # must not get the same answer as each other or as an empty directory.
         #
@@ -538,10 +589,10 @@ function Get-PMNewestWriteUtc {
     }
     # An EMPTY directory is a different thing entirely: nothing failed, there is simply no file to
     # date it, and its own timestamp is the best evidence available.
-    if ($newest -eq [datetime]::MinValue) {
-        try { $newest = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LastWriteTimeUtc } catch {}
+    if ($Stat.NewestUtc -eq [datetime]::MinValue) {
+        try { return (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LastWriteTimeUtc } catch { }
     }
-    return $newest
+    return $Stat.NewestUtc
 }
 
 function Expand-PMRoot {

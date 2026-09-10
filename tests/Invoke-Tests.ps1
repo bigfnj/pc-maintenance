@@ -1618,6 +1618,92 @@ It 'Test-PMPathTraversesLink fails closed on a directory it cannot inspect' {
     (Test-PMPathTraversesLink -Path 'Q:\nope\deeper\leaf' -Root 'Q:\nope')
 }
 
+Write-Host "`n== one fused walk must answer exactly what two walks did ==" -ForegroundColor Cyan
+# Get-PMTreeStat replaced two byte-for-byte identical traversals. The risk in that refactor is
+# not that it breaks loudly, it is that one of the four root cases drifts - so each is pinned
+# against the value the wrappers are contractually required to return.
+function New-PMStatTree {
+    $b = Join-Path ([IO.Path]::GetTempPath()) ("pm-stat-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path (Join-Path $b 'sub\deeper') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $b 'a.txt') -Value ('x' * 100) -Encoding Ascii -NoNewline
+    Set-Content -LiteralPath (Join-Path $b 'sub\b.txt') -Value ('x' * 200) -Encoding Ascii -NoNewline
+    Set-Content -LiteralPath (Join-Path $b 'sub\deeper\c.txt') -Value ('x' * 300) -Encoding Ascii -NoNewline
+    return $b
+}
+
+It 'Bytes sums the whole tree, and equals what Get-PMPathSize reports' {
+    $t = New-PMStatTree
+    try {
+        $st = Get-PMTreeStat -Path $t
+        ($st.Bytes -eq 600) -and ((Get-PMPathSize -Path $t) -eq 600) -and $st.Complete -and -not $st.Blind
+    } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'NewestUtc finds the deepest-written file, and equals Get-PMNewestWriteUtc' {
+    $t = New-PMStatTree
+    try {
+        $want = (Get-Date).ToUniversalTime().AddDays(-3)
+        (Get-Item -LiteralPath (Join-Path $t 'a.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-99)
+        (Get-Item -LiteralPath (Join-Path $t 'sub\b.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-50)
+        (Get-Item -LiteralPath (Join-Path $t 'sub\deeper\c.txt')).LastWriteTimeUtc = $want
+        $st = Get-PMTreeStat -Path $t
+        ([math]::Abs(($st.NewestUtc - $want).TotalSeconds) -lt 2) -and
+        ([math]::Abs(((Get-PMNewestWriteUtc -Path $t) - $want).TotalSeconds) -lt 2)
+    } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'an early exit marks Complete false, so Bytes is never read as a total' {
+    # The trap this guards: the age question stops at the first file past the cutoff, which
+    # leaves Bytes partial. agent-scratchpads only reads Bytes when Complete is true.
+    $t = New-PMStatTree
+    try {
+        $st = Get-PMTreeStat -Path $t -NewerThanUtc ((Get-Date).ToUniversalTime().AddDays(-1))
+        (-not $st.Complete) -and ($st.Bytes -lt 600)
+    } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a file root reports its own length, as Get-PMPathSize always has' {
+    $t = New-PMStatTree
+    try {
+        $f = Join-Path $t 'a.txt'
+        $st = Get-PMTreeStat -Path $f
+        ($st.RootKind -eq 'file') -and ($st.RootLength -eq 100) -and ((Get-PMPathSize -Path $f) -eq 100)
+    } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a missing root is 0 bytes and records no read error' {
+    Clear-PMReadErrors
+    $g = Join-Path ([IO.Path]::GetTempPath()) ("pm-absent-" + [guid]::NewGuid().ToString('N'))
+    $st = Get-PMTreeStat -Path $g
+    ($st.RootKind -eq 'missing') -and ((Get-PMPathSize -Path $g) -eq 0) -and ((Get-PMReadErrorCount) -eq 0)
+}
+It 'a reparse-point root still reports 0, because deleting the link frees nothing' {
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-rp-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $real = Join-Path $base 'real'; $link = Join-Path $base 'link'
+    New-Item -ItemType Directory -Path $real -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $real 'big.bin') -Value ('z' * 5000) -Encoding Ascii -NoNewline
+    try {
+        $null = cmd /c mklink /J "`"$link`"" "`"$real`"" 2>&1
+        if (-not (Test-Path -LiteralPath $link)) { return 'SKIP' }   # junctions unavailable
+        ((Get-PMTreeStat -Path $link).RootKind -eq 'reparse') -and ((Get-PMPathSize -Path $link) -eq 0)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'an unreadable tree sets Blind, and the age still resolves to JUST TOUCHED' {
+    $d = New-PMUnreadableDir
+    if (-not $d) { return 'SKIP' }
+    try {
+        (Get-Item -LiteralPath $d).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-200)
+        Clear-PMReadErrors
+        $st = Get-PMTreeStat -Path $d
+        $age = Resolve-PMTreeAge -Stat $st -Path $d
+        $st.Blind -and (((Get-Date).ToUniversalTime() - $age).TotalDays -lt 1) -and ((Get-PMReadErrorCount) -gt 0)
+    } finally { Remove-PMUnreadableDir $d }
+}
+It 'an EMPTY directory still dates from itself rather than reading as ancient' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-empty2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        $st = Get-PMTreeStat -Path $d
+        (-not $st.Blind) -and (((Get-Date).ToUniversalTime() - (Resolve-PMTreeAge -Stat $st -Path $d)).TotalDays -lt 1)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }
 Write-Host ("`n{0} passed, {1} failed{2}`n" -f $script:Pass, $script:Fail, $tail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })
