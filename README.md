@@ -147,6 +147,22 @@ cannot promote itself past a newer one. Set `reportsToKeep` in the manifest to c
 
 ## Tests
 
+Everything, in one command:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run-gate.ps1
+```
+
+`run-gate.ps1` runs both suites and gives one answer. It treats a **missing** suite as a
+failure rather than a warning, and a suite that exits 0 without printing a tally as a failure
+too — an exit code can be inherited from the last native command a script happened to run, so
+the tally is the independent evidence that the suite reached its own summary. It invokes
+`powershell.exe` for every suite regardless of the host you launch it from, because 5.1 is what
+the scheduled task runs. Run it from an elevated shell to exercise the deployment checks that
+are otherwise skipped.
+
+The individual suites still run on their own:
+
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-Tests.ps1
 ```
