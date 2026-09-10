@@ -94,25 +94,11 @@ Check 'the payload root exists' { Test-Path -LiteralPath $PayloadRoot }
 
 foreach ($item in (Get-PMPayloadItems)) {
     $i = $item
+    # Same definition the INSTALLER uses as its post-condition, deliberately. Two copies of
+    # "is this deployed" would be two things to keep in step, and the installer's copy silently
+    # weakening is exactly how lib\ went stale once already.
     Check "deployed '$i' is identical to the repo copy" {
-        $src = Join-Path $repoRoot $i
-        $dst = Join-Path $PayloadRoot $i
-        if (-not (Test-Path -LiteralPath $dst)) { return $false }
-        if (Test-Path -LiteralPath $src -PathType Leaf) {
-            return ((Get-FileHash -LiteralPath $src).Hash -eq (Get-FileHash -LiteralPath $dst).Hash)
-        }
-        # A directory: compare the set of relative paths AND every file hash. Comparing only
-        # names would miss the exact drift this test was written for.
-        $rel = { param($root) Get-ChildItem -LiteralPath $root -Recurse -File |
-                    ForEach-Object { $_.FullName.Substring($root.Length).TrimStart('\') } }
-        $a = @(& $rel $src | Sort-Object)
-        $b = @(& $rel $dst | Sort-Object)
-        if (($a -join '|') -ne ($b -join '|')) { return $false }
-        foreach ($r in $a) {
-            if ((Get-FileHash -LiteralPath (Join-Path $src $r)).Hash -ne
-                (Get-FileHash -LiteralPath (Join-Path $dst $r)).Hash) { return $false }
-        }
-        return $true
+        Test-PMPayloadItemCurrent -Source (Join-Path $repoRoot $i) -Dest (Join-Path $PayloadRoot $i)
     }
 }
 

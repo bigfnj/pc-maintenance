@@ -1867,6 +1867,155 @@ function Repair-PMModule {
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== a CHANGE is claimed only where it was proved ==" -ForegroundColor Cyan
+# The rule this enforces: Write-PMLog at 'CHANGE' level asserts that state was altered, and may
+# only be emitted by Invoke-PMChange, which computes it from a post-condition.
+#
+# A helper you can bypass is a convention; a test that fails when you bypass it is a rule. Six
+# instances of "confident sentence about something never checked" were fixed by hand in one
+# audit round, and three MORE were still live in 160 lines of installer afterwards - so the
+# discipline demonstrably does not scale without something mechanical behind it.
+#
+# AST rather than grep: a regex over source cannot tell a real call from the same text inside a
+# comment or a here-string, and this suite has retired source-text greps once already for
+# exactly that reason (BACKLOG item 1).
+#
+# Scoped to 'CHANGE' and not 'OK'. OK carries genuine status as well as claims - "=== install
+# complete ===", "report: <path>" - so a rule covering it would fire constantly and be turned
+# off. CHANGE has exactly one meaning.
+function Get-PMChangeCallSite {
+    param([string]$File)
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($File, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count) { return @() }
+    $out = @()
+    foreach ($cmd in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        if ($cmd.GetCommandName() -ne 'Write-PMLog') { continue }
+        # 'CHANGE' as any bare or quoted argument - covers both the positional level and -Level.
+        $isChange = $false
+        foreach ($el in $cmd.CommandElements) {
+            if ($el -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $el.Value -eq 'CHANGE') { $isChange = $true }
+        }
+        if (-not $isChange) { continue }
+        # Which function encloses it?
+        $fn = $cmd.Parent
+        while ($fn -and -not ($fn -is [System.Management.Automation.Language.FunctionDefinitionAst])) { $fn = $fn.Parent }
+        $out += [pscustomobject]@{
+            File = [IO.Path]::GetFileName($File)
+            Line = $cmd.Extent.StartLineNumber
+            In   = $(if ($fn) { $fn.Name } else { '<top level>' })
+            Text = $cmd.Extent.Text
+        }
+    }
+    return $out
+}
+
+It 'every CHANGE-level claim comes from Invoke-PMChange, or is explicitly allowed' {
+    # Two allowed exceptions, both REPORTING a result object produced by a function that already
+    # measured - not asserting a change of their own:
+    #   Invoke-PcMaintenance : the module's own Repair result (Ok/Bytes measured by the module)
+    #   Uninstall            : Remove-PMPayloadFiles' outcome, which measures survivors itself
+    # Listed by file+function so a THIRD one cannot appear silently. If this test fails, the
+    # question to ask is "what proves this?" - not "how do I add it to the list".
+    $allowed = @(
+        'Invoke-PcMaintenance.ps1:<top level>',
+        'Uninstall-PcMaintenance.ps1:<top level>',
+        'PMCommon.ps1:Invoke-PMChange'
+    )
+    $files = @(Get-ChildItem -LiteralPath $root -Filter *.ps1 -File) +
+             @(Get-ChildItem -LiteralPath (Join-Path $root 'lib') -Filter *.ps1 -File) +
+             @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Filter *.ps1 -File -Recurse)
+    $offenders = @()
+    foreach ($f in $files) {
+        foreach ($site in (Get-PMChangeCallSite -File $f.FullName)) {
+            if ($allowed -notcontains ("{0}:{1}" -f $site.File, $site.In)) {
+                $offenders += ("{0}:{1} in {2} -> {3}" -f $site.File, $site.Line, $site.In, $site.Text)
+            }
+        }
+    }
+    if ($offenders.Count) { $offenders | ForEach-Object { Write-Host "      $_" -ForegroundColor Red } }
+    $offenders.Count -eq 0
+}
+It 'and the detector actually finds them, so a green result means something' {
+    # Positive control. Without it a broken AST walk returns zero offenders and the rule above
+    # passes over anything at all - the same "verifies nothing" failure it exists to prevent.
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("pm-ast-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".ps1")
+    try {
+        @'
+function Sneaky {
+    Remove-Item -LiteralPath 'C:\nope' -ErrorAction SilentlyContinue
+    Write-PMLog "removed the thing" 'CHANGE'
+}
+'@ | Set-Content -LiteralPath $tmp -Encoding UTF8
+        $found = @(Get-PMChangeCallSite -File $tmp)
+        ($found.Count -eq 1) -and ($found[0].In -eq 'Sneaky')
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+It 'and it does NOT fire on the word CHANGE inside a comment or a string' {
+    # The reason this is an AST walk and not a grep.
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("pm-ast2-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".ps1")
+    try {
+        @'
+function Innocent {
+    # this comment mentions Write-PMLog 'CHANGE' and must not count
+    $doc = "Write-PMLog 'CHANGE' inside a string"
+    Write-PMLog "just informing" 'INFO'
+}
+'@ | Set-Content -LiteralPath $tmp -Encoding UTF8
+        @(Get-PMChangeCallSite -File $tmp).Count -eq 0
+    } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== Invoke-PMChange reports from the post-condition, never the action ==" -ForegroundColor Cyan
+It 'a silently failing action is reported as FAILURE' {
+    # The Remove-PMPayloadFiles bug in miniature: the action swallows its own error, so anything
+    # reading the action would call this a success.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-ch1-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    $held = Join-Path $d 'locked.txt'
+    Set-Content -LiteralPath $held -Value 'x' -Encoding UTF8
+    $fs = [IO.File]::Open($held, 'Open', 'Read', 'None')
+    try {
+        $r = Invoke-PMChange -What 'remove a locked file' `
+            -Action { Remove-Item -LiteralPath $held -Force -ErrorAction SilentlyContinue } `
+            -Verify { -not (Test-Path -LiteralPath $held) }
+        (-not $r.Ok) -and (-not $r.Changed) -and (Test-Path -LiteralPath $held)
+    } finally { $fs.Dispose(); Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a NOISY action that actually worked is reported as SUCCESS' {
+    # The installer's exit-1 bug in miniature: stderr output, and a throw, from an action whose
+    # post-condition is satisfied. The verdict must come from the post-condition.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-ch2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    $f = Join-Path $d 'gone.txt'
+    Set-Content -LiteralPath $f -Value 'x' -Encoding UTF8
+    try {
+        $r = Invoke-PMChange -What 'remove a file, noisily' `
+            -Action { Remove-Item -LiteralPath $f -Force; Write-Error 'banner noise'; throw 'and a throw' } `
+            -Verify { -not (Test-Path -LiteralPath $f) }
+        $r.Ok -and $r.Changed
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a NO-OP action fails its own post-condition' {
+    # The USN-shrink bug in miniature: the call succeeds and changes nothing.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-ch3-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        $r = Invoke-PMChange -What 'pretend to shrink something' -Action { } -Verify { $false }
+        (-not $r.Ok) -and ($r.Detail -like '*did not take effect*')
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'an already-satisfied post-condition reports "already done", not work performed' {
+    $script:ran = $false
+    $r = Invoke-PMChange -What 'do a thing already done' -Action { $script:ran = $true } -Verify { $true }
+    $r.Ok -and $r.AlreadyDone -and (-not $r.Changed) -and (-not $script:ran)
+}
+It 'and -DryRun performs nothing' {
+    $script:ran2 = $false
+    $r = Invoke-PMChange -What 'a dry run' -Action { $script:ran2 = $true } -Verify { $false } -DryRun
+    $r.Ok -and (-not $script:ran2) -and ($r.Detail -like '*DRY-RUN*')
+}
+
 Write-Host "`n== gates 1-3 are enforced at the deletion primitive, not only upstream (6i) ==" -ForegroundColor Cyan
 # These run OUTSIDE a module phase, so they set the phase stamps by hand - which is exactly what
 # Invoke-PMModulePhase does after dot-sourcing the module.

@@ -49,12 +49,14 @@ if (-not (Test-PMElevated)) {
     catch { Write-PMLog "could not elevate: $($_.Exception.Message)" 'ERROR'; exit 1 }
 }
 
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-PMLog "removed scheduled task '$TaskName'" 'CHANGE'
-} else {
-    Write-PMLog "no scheduled task '$TaskName' registered" 'SKIP'
-}
+# Unregister-ScheduledTask carried no -ErrorAction Stop and nothing checked afterwards, so a
+# failure to remove printed "removed scheduled task" and moved on. Invoke-PMChange reports from
+# the post-condition, and its before-check turns "there was no task" into an honest "already
+# done" rather than a special case here.
+$taskGone = Invoke-PMChange -What "remove scheduled task '$TaskName'" `
+    -Action { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false } `
+    -Verify { -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) }
+if (-not $taskGone.Ok) { exit 1 }
 
 if ($RemoveFiles) {
     # The guard, the -KeepLogs split and the delete itself all live in Remove-PMPayloadFiles, so

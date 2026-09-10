@@ -909,6 +909,138 @@ function Remove-PMPath {
     }
 }
 
+function Test-PMPayloadItemCurrent {
+    <#
+        Is the deployed copy of one payload item IDENTICAL to the source?
+
+        Exists because "the destination exists" is not the same claim as "the current version is
+        deployed", and using the first as a post-condition silently broke the installer: with
+        Invoke-PMChange's before-check in front of the copy, every item reported "already done"
+        and nothing was copied at all. lib\ went stale on a live machine within a minute of the
+        change - the exact failure the deployment smoke test was written for, reintroduced by
+        the fix for a different instance of the same family.
+
+        The lesson is narrow and worth keeping: a post-condition has to express what the change
+        MEANS, not merely that something is present afterwards. Existence is the weakest possible
+        reading of "deployed".
+
+        Hashes rather than timestamps: mtime survives a copy, differs harmlessly after a
+        checkout, and is settable by anything. Compares the full relative-path SET too, so an
+        extra file at the destination - the lib\lib\ nesting case - counts as not-current.
+    #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Dest)
+    if (-not (Test-Path -LiteralPath $Dest)) { return $false }
+    if (Test-Path -LiteralPath $Source -PathType Leaf) {
+        if (-not (Test-Path -LiteralPath $Dest -PathType Leaf)) { return $false }
+        try { return ((Get-FileHash -LiteralPath $Source).Hash -eq (Get-FileHash -LiteralPath $Dest).Hash) }
+        catch { return $false }
+    }
+    try {
+        $rel = {
+            param($root)
+            @(Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction Stop |
+                ForEach-Object { $_.FullName.Substring($root.Length).TrimStart('\') })
+        }
+        $a = @(& $rel $Source | Sort-Object)
+        $b = @(& $rel $Dest   | Sort-Object)
+        if (($a -join '|') -ne ($b -join '|')) { return $false }
+        foreach ($r in $a) {
+            if ((Get-FileHash -LiteralPath (Join-Path $Source $r)).Hash -ne
+                (Get-FileHash -LiteralPath (Join-Path $Dest $r)).Hash) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-PMChange {
+    <#
+        Make a change, then PROVE it, and report from the proof.
+
+        Six times in one audit round this codebase emitted a confident sentence about something
+        it never checked:
+
+          * Remove-PMPayloadFiles set Removed = $true unconditionally while the deletes ran under
+            -ErrorAction SilentlyContinue, so a locked file reported a removed payload.
+          * install-deletion-forensics exited 1 on a completely successful install, because
+            Sysmon writes its banner to stderr and $ErrorActionPreference was Stop.
+          * Its -Uninstall printed "USN journal returned to 32 MB" while the journal sat at
+            2,048 MB, because createjournal cannot shrink and silently does nothing.
+          * -Verify reported "no weekly report task" about a task registered seconds earlier,
+            because a SYSTEM task is admin-only to VIEW.
+
+        Every one of them has the same shape: the CLAIM and the EVIDENCE are separate statements,
+        and nothing in the language couples them. `Write-PMLog "removed X" 'CHANGE'` is exactly
+        as easy to write whether or not X was removed.
+
+        This couples them. Success is computed from -Verify and NEVER from -Action, so:
+
+          * an error swallowed inside -Action cannot read as success
+          * noise on stderr, or a non-zero exit from a native tool that actually worked, cannot
+            read as failure
+          * a no-op that changes nothing fails its own post-condition
+
+        -Verify is MANDATORY. That is the point of the helper; an optional post-condition is a
+        post-condition nobody writes. Evaluated BEFORE as well as after, so a change that was
+        already in place is reported honestly as "already" rather than as work done.
+
+        WHAT THIS IS NOT. The predicate can itself be wrong, and some things cannot be verified
+        at all - "the scheduled task ran" is not observable at the moment you start it. This
+        relocates the trust into one small reviewable expression per change instead of spreading
+        it across scattered log lines. Where a thing genuinely cannot be checked, say "requested"
+        rather than "done" and do not pretend otherwise.
+
+        Returns @{ Ok; Changed; AlreadyDone; Detail; Error }.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$What,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [Parameter(Mandatory)][scriptblock]$Verify,
+        [switch]$DryRun,
+        # Report a failed post-condition as a warning rather than an error. For deliveries whose
+        # loss must not fail the run - the report step is the standing example.
+        [switch]$SoftFail
+    )
+    $r = [ordered]@{ Ok = $false; Changed = $false; AlreadyDone = $false; Detail = ''; Error = $null }
+
+    $before = $false
+    try { $before = [bool](& $Verify) } catch { $before = $false }
+    if ($before) {
+        $r.Ok = $true; $r.AlreadyDone = $true
+        $r.Detail = "$What - already done"
+        Write-PMLog $r.Detail 'SKIP'
+        return $r
+    }
+
+    if ($DryRun) {
+        $r.Ok = $true
+        $r.Detail = "[DRY-RUN] $What"
+        Write-PMLog $r.Detail 'INFO'
+        return $r
+    }
+
+    # The action's own failure mode is deliberately NOT the verdict. It is captured for the
+    # message, because "it threw X and the post-condition is still false" is far more useful
+    # than either half alone - but the verdict below comes from the post-condition.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $null = & $Action 2>&1 } catch { $r.Error = $_ } finally { $ErrorActionPreference = $prev }
+
+    $after = $false
+    try { $after = [bool](& $Verify) } catch { $r.Error = $_; $after = $false }
+
+    if ($after) {
+        $r.Ok = $true; $r.Changed = $true
+        $r.Detail = $What
+        Write-PMLog $r.Detail 'CHANGE'
+    } else {
+        $r.Ok = $false
+        $r.Detail = if ($r.Error) { "$What - FAILED: $($r.Error.Exception.Message)" }
+                    else { "$What - did not take effect" }
+        Write-PMLog $r.Detail $(if ($SoftFail) { 'WARN' } else { 'ERROR' })
+    }
+    return $r
+}
+
 function Get-PMRemovalBucket {
     <#
         Map a Remove-PMPath result Reason to the bucket a module's Repair counts it in:

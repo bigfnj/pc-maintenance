@@ -85,20 +85,21 @@ foreach ($i in $items) {
     # hardened the ACL, registered the task and printed "install complete", exit 0, while the
     # weekly SYSTEM task ran stale code indefinitely. The ACL check cannot catch that: the ACL
     # is fine, the payload is wrong.
-    try {
-        if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction Stop }
-        Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force -ErrorAction Stop
-    } catch {
-        Write-PMLog "could not deploy '$i': $($_.Exception.Message)" 'ERROR'
-        exit 1
-    }
-    # Prove it landed rather than trusting the copy. Catches the nesting case specifically:
-    # lib\lib\ exists means the delete silently failed.
-    if (-not (Test-Path -LiteralPath $dst)) { Write-PMLog "deploy verification failed: $dst is missing" 'ERROR'; exit 1 }
-    if ((Test-Path -LiteralPath $src -PathType Container) -and (Test-Path -LiteralPath (Join-Path $dst $i))) {
-        Write-PMLog "deploy verification failed: '$i' nested itself at $(Join-Path $dst $i)" 'ERROR'; exit 1
-    }
-    Write-PMLog "deployed $i" 'CHANGE'
+    # The post-condition is "the deployed copy is IDENTICAL to the source", which is what
+    # "deployed" actually means. The first version of this asserted only that the destination
+    # existed - and because Invoke-PMChange checks the post-condition BEFORE acting, every item
+    # reported "already done" and nothing was copied. lib\ went stale on this machine within a
+    # minute, reintroducing precisely the fault the deployment smoke test exists to catch.
+    #
+    # Hash comparison also subsumes the lib\lib\ nesting case for free: a nested copy changes
+    # the destination's file set, so it is not identical.
+    $deployed = Invoke-PMChange -What "deploy $i" `
+        -Action {
+            if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction Stop }
+            Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force -ErrorAction Stop
+        } `
+        -Verify { Test-PMPayloadItemCurrent -Source $src -Dest $dst }
+    if (-not $deployed.Ok) { exit 1 }
 }
 New-Item -ItemType Directory -Path (Join-Path $PayloadRoot 'logs') -Force | Out-Null
 
@@ -136,23 +137,37 @@ if ($ReportOnlySchedule) {
 
 try {
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-PMLog 'removed the previous task registration' 'CHANGE'
+        $gone = Invoke-PMChange -What 'remove the previous task registration' `
+            -Action { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false } `
+            -Verify { -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) }
+        if (-not $gone.Ok) { exit 1 }
     }
     # Register-ScheduledTask -Xml <string>, not schtasks.exe /xml: the XML is passed in memory, so
     # there is no temp file and no encoding pitfall, and a failure comes back as a real error.
-    $null = Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop
-    Write-PMLog "registered scheduled task '$TaskName' (weekly, Sunday 03:00, SYSTEM)" 'OK'
+    #
+    # Verified by re-reading the registration rather than by the call not throwing: -ErrorAction
+    # Stop catches an outright refusal, but "the cmdlet returned" and "a task named this now
+    # exists and runs as SYSTEM" are different claims, and only the second is the one being made.
+    $registered = Invoke-PMChange -What "register scheduled task '$TaskName' (weekly, Sunday 03:00, SYSTEM)" `
+        -Action { $null = Register-ScheduledTask -TaskName $TaskName -Xml $xml -Force -ErrorAction Stop } `
+        -Verify {
+            $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            $t -and $t.Principal.UserId -match '(?i)system'
+        }
+    if (-not $registered.Ok) { exit 1 }
 } catch {
     Write-PMLog "task registration failed: $($_.Exception.Message)" 'ERROR'
     exit 1
 }
 
 if ($RunNow) {
-    Write-PMLog 'starting the task now...' 'INFO'
+    # REQUESTED, not "started". Whether the sweep then succeeds is not observable at the moment
+    # the task is kicked off, and the previous wording ("started; see the run json") claimed a
+    # run that may not have happened. Where a thing cannot be checked, the honest output says so
+    # rather than borrowing confidence from the call returning.
     try {
         Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-        Write-PMLog 'started; see the run json under the payload logs directory' 'OK'
+        Write-PMLog 'run requested; check the run json under the payload logs directory' 'INFO'
     } catch { Write-PMLog "could not start: $($_.Exception.Message)" 'WARN' }
 }
 
