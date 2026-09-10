@@ -307,6 +307,11 @@ h2 { font-size:14px; font-weight:600; text-transform:uppercase; letter-spacing:0
 .card .detail { color:var(--ink-2); font-size:14px; margin:8px 0 0; }
 .meter { height:6px; border-radius:3px; background:var(--bar-track); margin-top:14px; overflow:hidden; }
 .meter > i { display:block; height:100%; background:var(--bar); border-radius:3px; }
+.why { margin-top:12px; border-top:1px solid var(--border); padding-top:8px; }
+.why > summary { cursor:pointer; color:var(--muted); font-size:13px; list-style:none; }
+.why > summary::-webkit-details-marker { display:none; }
+.why-sum { font-size:13px; margin:10px 0 6px; }
+.why-body { white-space:pre-wrap; font:12px/1.5 ui-monospace,Consolas,monospace; color:var(--muted); margin:0; overflow-x:auto; }
 table { width:100%; border-collapse:collapse; margin-top:14px; font-size:13px; }
 th { text-align:left; font-weight:600; color:var(--ink-2); font-size:12px;
      text-transform:uppercase; letter-spacing:0.04em; padding:6px 8px; border-bottom:1px solid var(--rule); }
@@ -329,7 +334,17 @@ function New-PMHtmlReport {
     #>
     param(
         [Parameter(Mandatory)]$Run,
-        [Parameter(Mandatory)][string]$OutPath
+        [Parameter(Mandatory)][string]$OutPath,
+        # id -> @{ Description; Details }. Deliberately NOT part of $Run.
+        #
+        # The docstring above says this renders the same object that goes to run-<id>.json so
+        # the HTML can never disagree with the machine-readable record, and that still holds:
+        # everything MEASURED comes from $Run. This is different in kind - the module's own
+        # static description of the rule it applies, identical on every run. Routing it through
+        # $Run would add ~100 lines of prose x 4 modules to a file written twice per run and
+        # retained 50 runs deep, to say the same thing 400 times. None of it is a measurement,
+        # so none of it can contradict one.
+        $ModuleDoc = @{}
     )
 
     $isApply   = ($Run.mode -eq 'apply')
@@ -413,6 +428,27 @@ function New-PMHtmlReport {
         if ($bytes -gt 0) { [void]$sb.AppendLine('<span class="size">' + (ConvertTo-PMHtml (Format-PMBytes $bytes)) + '</span>') }
         [void]$sb.AppendLine('</div>')
         [void]$sb.AppendLine('<p class="detail">' + (ConvertTo-PMHtml $m.detail) + '</p>')
+
+        # WHY this module did that, collapsed. The report could always say what happened and
+        # never why the rule is what it is - and the prose answering that sat unread in each
+        # module.psd1, reachable only by opening the source. It matters most for the section
+        # every block calls "What it never touches": this tool deletes as SYSTEM, and a reader
+        # wondering whether their Plex library was ever at risk should not have to take the
+        # answer on trust. Closed by default, so the page stays lean.
+        $doc = $null
+        if ($ModuleDoc -and $ModuleDoc.ContainsKey([string]$m.id)) { $doc = $ModuleDoc[[string]$m.id] }
+        if ($doc -and ($doc.Description -or $doc.Details)) {
+            [void]$sb.AppendLine('<details class="why"><summary>Why this module deletes what it deletes</summary>')
+            if ($doc.Description) {
+                [void]$sb.AppendLine('<p class="why-sum">' + (ConvertTo-PMHtml ([string]$doc.Description)) + '</p>')
+            }
+            if ($doc.Details) {
+                # pre-wrap: the source is a here-string whose indentation carries the structure.
+                # Escaped like any other text this report did not author.
+                [void]$sb.AppendLine('<pre class="why-body">' + (ConvertTo-PMHtml ([string]$doc.Details)) + '</pre>')
+            }
+            [void]$sb.AppendLine('</details>')
+        }
 
         if ($bytes -gt 0 -and $maxBytes -gt 0) {
             $pct = [int](100 * $bytes / $maxBytes)

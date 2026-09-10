@@ -2,7 +2,6 @@
     Id                = 'stale-app-temp'
     Name              = 'Stale application temp folders'
     Category          = 'maintenance'
-    Version           = '1.0.0'
     RequiresUserSid   = $true
     AutoApply         = $false
     Roots             = @('%LOCALAPPDATA%\Temp')

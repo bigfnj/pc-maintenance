@@ -637,7 +637,7 @@ returns entries in name order, and measured both ways - sorting LAST frees 6,000
 throw, sorting FIRST aborts immediately and frees nothing, which would have made the
 partial-bytes assertion a tautology.
 
-### 7i. Dead manifest keys, ~100 lines of them
+### 7i. ~~Dead manifest keys, ~100 lines of them~~ DONE 2026-09-10
 
 `Import-PMModuleInfo` reads only `Id, Name, Category, Entry, Roots`. Every `module.psd1` also
 defines `Version`, `Description` and `Details` - the last being a here-string of roughly 25 lines
@@ -645,6 +645,22 @@ per module - and none of the three is read by any `.ps1`. `Description` and `Det
 in test fixtures. Either render them in the report (they are good prose and the report has no
 per-module explanation) or delete them; carrying documentation that nothing displays is the
 worst of both.
+
+**Resolved by RENDERING it, not deleting it.** The prose was the best writing in the repo and
+it answered the one question the report could not: not what happened, but why the rule is what
+it is. "What it never touches" matters most - this tool deletes as SYSTEM, and a reader
+wondering whether their Plex library was ever at risk should not have to take the answer on
+trust. It now appears per module card behind a closed `<details>`.
+
+`Version` WAS deleted from all four psd1 files: `'1.0.0'` in every one, bumped by nothing. A
+version number nobody maintains is worse than none.
+
+The prose travels to the renderer as `-ModuleDoc`, deliberately NOT through the run object.
+`New-PMHtmlReport`'s docstring says it renders the same object that goes to run-<id>.json so the
+HTML can never disagree with the machine-readable record, and that still holds - everything
+MEASURED comes from `$Run`. This is different in kind: a static description, identical every
+run. Routing it through `$Run` would have added ~100 lines x 4 modules to a file written twice
+per run and retained 50 runs deep, to say the same thing 400 times.
 
 ### 7j. ~~`$KnownSizes` is inert in `plex-bif-orphans`~~ DONE 2026-09-10
 

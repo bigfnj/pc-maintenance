@@ -2,7 +2,6 @@
     Id                = 'vs-installer-scratch'
     Name              = 'Visual Studio Installer scratch'
     Category          = 'maintenance'
-    Version           = '1.0.0'
     RequiresUserSid   = $true
     AutoApply         = $true
     Roots             = @('%LOCALAPPDATA%\Temp')

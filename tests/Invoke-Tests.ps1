@@ -1274,6 +1274,11 @@ try {
         # directory silently breaks every card after it.
         ($html -match 'a &amp; &lt;b&gt;&quot;q&quot;') -and ($html -notmatch 'a & <b>"q"')
     }
+    It 'renders no "why" section when no module prose was supplied' {
+        # The positive control for the two below. -ModuleDoc defaults to empty, and a report
+        # that grew an empty disclosure per card would be worse than not having the feature.
+        $html -notmatch 'Why this module deletes'
+    }
     It 'is self-contained: no external fetch' {
         # The report is opened offline, from Downloads, possibly months later. Any CDN,
         # webfont or remote image would render it broken exactly when it is needed.
@@ -1296,6 +1301,36 @@ try {
         finally { Remove-Item -LiteralPath $o2 -Force -ErrorAction SilentlyContinue }
     }
 } finally { Remove-Item -LiteralPath $reportOut -Force -ErrorAction SilentlyContinue }
+
+Write-Host "`n== the report can finally say WHY a module deleted something ==" -ForegroundColor Cyan
+# The prose in each module.psd1 - What it fixes / How it identifies one / What it never touches
+# / Why AutoApply is on - was read by nothing. The report said what happened and never why the
+# rule is what it is, which for a tool that deletes as SYSTEM is the question that matters most.
+$whyOut = Join-Path ([IO.Path]::GetTempPath()) ("pm-why-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".html")
+try {
+    $whyDoc = @{ 'mod-found' = @{ Description = 'a one-line summary'
+                                  Details     = "What it never touches`n  the library, only the cache <&>" } }
+    $null = New-PMHtmlReport -Run $fakeRun -OutPath $whyOut -ModuleDoc $whyDoc
+    $whyHtml = Get-Content -LiteralPath $whyOut -Raw
+
+    It 'the module prose reaches the page' {
+        ($whyHtml -match 'Why this module deletes') -and ($whyHtml -match 'a one-line summary') -and
+        ($whyHtml -match 'What it never touches')
+    }
+    It 'it is collapsed by default, so the page stays lean' {
+        # <details> without the open attribute. A section forced open on every card is the
+        # thing that made this prose not worth rendering in the first place.
+        ($whyHtml -match '<details class="why">') -and ($whyHtml -notmatch '<details class="why" open')
+    }
+    It 'and it is escaped like any other text the report did not author' {
+        ($whyHtml -match 'cache &lt;&amp;&gt;') -and ($whyHtml -notmatch 'cache <&>')
+    }
+    It 'a module with no prose gets no empty disclosure' {
+        # mod-clean was not given any. Rendering a "why" with nothing under it would be worse
+        # than omitting it.
+        ([regex]::Matches($whyHtml, '<details class="why">')).Count -eq 1
+    }
+} finally { Remove-Item -LiteralPath $whyOut -Force -ErrorAction SilentlyContinue }
 
 It 'Downloads resolution never returns empty' {
     # Degrades profile -> TEMP rather than failing: a missing report must not look like a

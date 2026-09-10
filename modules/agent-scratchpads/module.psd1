@@ -2,7 +2,6 @@
     Id                = 'agent-scratchpads'
     Name              = 'Coding-agent scratchpads'
     Category          = 'maintenance'
-    Version           = '1.0.0'
     RequiresUserSid   = $true
     AutoApply         = $true
     Roots             = @('%LOCALAPPDATA%\Temp\claude')

@@ -2,7 +2,6 @@
     Id                = 'plex-bif-orphans'
     Name              = 'Plex preview .tmp orphans'
     Category          = 'maintenance'
-    Version           = '1.0.0'
     RequiresUserSid   = $true
     AutoApply         = $true
     # ENFORCED, not decorative: the dispatcher expands these against the interactive user and

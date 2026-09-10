@@ -97,6 +97,7 @@ if ($insecure.Count) {
 }
 
 $results = @()
+$moduleDoc = @{}
 # 'incomplete', not 'partial': summary.partial already exists here and means something else
 # entirely - the number of locations that could not be READ. Reusing the word would have put
 # two unrelated quantities under one name in a log format kept 50 runs deep and diffed week
@@ -161,6 +162,11 @@ try {
             # reports LoggedIn=$false. That is fine for reporting - a wrong number is visible and
             # harmless - and not fine for removal, which on a multi-profile machine with nobody
             # signed in would delete inside a stranger's Temp.
+            # Static prose for the report, gathered where the psd1 is already in hand. Kept
+            # out of $row - and so out of the run JSON - deliberately; see -ModuleDoc on
+            # New-PMHtmlReport.
+            $moduleDoc[$modId] = @{ Description = [string]$info['Description']
+                                    Details     = [string]$info['Details'] }
             $needsUser = [bool]$info['RequiresUserSid']
             if ($mayApply -and -not (Test-PMActingUserConfirmed -RequiresUserSid $needsUser -LoggedIn ([bool]$user.LoggedIn))) {
                 $mayApply = $false
@@ -392,7 +398,7 @@ try {
         try {
             $dl = Get-PMDownloadsPath -UserSid $user.Sid -UserProfile $user.Profile
             $reportPath = Join-Path $dl (Get-PMReportFileName -When (Get-Date))
-            $null = New-PMHtmlReport -Run $runObj -OutPath $reportPath
+            $null = New-PMHtmlReport -Run $runObj -OutPath $reportPath -ModuleDoc $moduleDoc
             Write-PMLog "report: $reportPath" 'OK'
             # Keep this run and the one before it, so the delta is readable without Downloads
             # filling up. Strictly name-matched; see Remove-PMOldReports for why this does not
