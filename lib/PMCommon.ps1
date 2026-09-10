@@ -104,6 +104,13 @@ $script:PMForbiddenPathPatterns = @(
     '^[A-Za-z]:\\Windows($|\\)'
     '^[A-Za-z]:\\Program Files( \(x86\))?($|\\)'
     '^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|Pictures|Videos|Music|Downloads)($|\\)'
+    # The profile root ITSELF, and the AppData roots, as targets. Nothing enumerates these, but
+    # -PayloadRoot is operator input and MinDepth 2 accepts C:\Users\Admin quite happily, so
+    # without these an uninstall pointed at a profile would recursively delete it. Anchored with
+    # $ so only the container matches - every module still sweeps freely BELOW them.
+    '^[A-Za-z]:\\Users\\?$'
+    '^[A-Za-z]:\\Users\\[^\\]+\\?$'
+    '^[A-Za-z]:\\Users\\[^\\]+\\AppData(\\(Local|LocalLow|Roaming))?\\?$'
     # Known Folder Move is the Windows 11 default, so the REAL Documents/Desktop/Pictures for
     # most people live under OneDrive and the pattern above never sees them. Measured before
     # this line existed: C:\Users\X\OneDrive\Documents\tax returned safe.
@@ -429,6 +436,12 @@ function Get-PMNewestWriteUtc {
         [switch]$Critical
     )
     $newest = [datetime]::MinValue
+    $blind  = $false        # did ANY read fail? see the end of the function for why it decides the answer
+    # The early exit below only means anything when the caller gave us a cutoff to beat. With the
+    # default MinValue EVERY file beats it, so this returned after the first file it happened to
+    # enumerate - not the newest, which is the one thing the function is named for. Production
+    # always passes a cutoff, so only callers that omitted it were getting the wrong answer.
+    $canExitEarly = ($NewerThanUtc -gt [datetime]::MinValue)
     $stack = New-Object 'System.Collections.Generic.Stack[string]'
     $stack.Push($Path)
     while ($stack.Count -gt 0) {
@@ -437,7 +450,9 @@ function Get-PMNewestWriteUtc {
             $di = New-Object System.IO.DirectoryInfo($dir)
             foreach ($f in $di.EnumerateFiles()) {
                 if ($f.LastWriteTimeUtc -gt $newest) { $newest = $f.LastWriteTimeUtc }
-                if ($newest -gt $NewerThanUtc) { return $newest }   # early exit: known to be active
+                # Safe to leave without the $blind check: we already know something in here is
+                # newer than the cutoff, so the answer is "active", which is the sparing answer.
+                if ($canExitEarly -and $newest -gt $NewerThanUtc) { return $newest }
             }
             foreach ($sub in $di.EnumerateDirectories()) {
                 if ($sub.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
@@ -445,10 +460,29 @@ function Get-PMNewestWriteUtc {
             }
         } catch {
             Add-PMReadError -Errors $_ -Critical:$Critical
+            $blind = $true
         }
     }
-    # An empty directory has no files to date it. Fall back to its own timestamp rather than
-    # returning MinValue, which would read as "ancient" and make it instantly deletable.
+    if ($blind) {
+        # We could not read all of it, so we do not KNOW its age, and the two ways of not knowing
+        # must not get the same answer as each other or as an empty directory.
+        #
+        # The directory's own stamp is effectively its creation time - that is the entire reason
+        # this function exists - so using it for a tree we could not read reports a session
+        # written seconds ago as months idle. Measured: a live session behind a Deny ACE reported
+        # 200.0 idle days, sailed past the 14-day floor, and became a delete candidate in the one
+        # module that has AutoApply, while reporting 0 bytes freed.
+        #
+        # A partial read is the same hazard in slower motion: files we could see are older than
+        # files we could not, so any answer built from them is an over-estimate of idleness.
+        #
+        # Unknown age therefore reads as JUST TOUCHED. An age floor can then only ever spare it,
+        # never select it, and the read error is still recorded so the run reports the gap
+        # instead of quietly narrowing its own coverage.
+        return (Get-Date).ToUniversalTime()
+    }
+    # An EMPTY directory is a different thing entirely: nothing failed, there is simply no file to
+    # date it, and its own timestamp is the best evidence available.
     if ($newest -eq [datetime]::MinValue) {
         try { $newest = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).LastWriteTimeUtc } catch {}
     }
@@ -645,7 +679,17 @@ function Remove-PMPayloadFiles {
     )
     $r = [pscustomobject]@{ Blocked = $false; Removed = $false; KeptLogs = $false; Detail = '' }
 
-    $guardRoot = Split-Path -Parent $Root
+    # Split-Path returns '' for 'C:\' and THROWS for 'C:'. Test-PMPathSafe's [string[]]$Roots then
+    # rejects the empty element at BIND time, which is a statement-terminating error, not $false -
+    # it unwound past this function entirely, so the caller's Blocked check never ran and
+    # Uninstall-PcMaintenance.ps1 printed "uninstall complete" and exited 0 without refusing
+    # anything. Handle it here, where refusing is what we mean.
+    $guardRoot = try { Split-Path -Parent $Root } catch { $null }
+    if ([string]::IsNullOrWhiteSpace($guardRoot)) {
+        $r.Blocked = $true
+        $r.Detail  = "refusing to delete '$Root' - it has no parent, so it is a drive root or malformed"
+        return $r
+    }
     if (-not (Test-PMPathSafe -Path $Root -Roots @($guardRoot) -MinDepth 2)) {
         $r.Blocked = $true
         $r.Detail  = "refusing to delete '$Root' - the path guard rejects it"
@@ -659,16 +703,22 @@ function Remove-PMPayloadFiles {
     if ($KeepLogs) {
         $logsDir = Join-Path $Root 'logs'
         $hadLogs = Test-Path -LiteralPath $logsDir
+        # Removed used to be the constant $true here, while the deletes ran under
+        # -ErrorAction SilentlyContinue. A locked or ACL-denied file under lib\ therefore produced
+        # "removed the payload, kept ...\logs" at CHANGE level, exit 0, with a SYSTEM-executed
+        # script tree still on disk. Measure it instead of asserting it.
+        $survived = @()
         foreach ($i in (Get-PMPayloadItems)) {
             $item = Join-Path $Root $i
-            if (Test-Path -LiteralPath $item) {
-                Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction SilentlyContinue
-            }
+            if (-not (Test-Path -LiteralPath $item)) { continue }
+            Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $item) { $survived += $i }
         }
-        $r.Removed  = $true
+        $r.Removed  = ($survived.Count -eq 0)
         $r.KeptLogs = $hadLogs
-        $r.Detail   = if ($hadLogs) { "removed the payload, kept $logsDir" }
-                      else { 'removed the payload; there was no logs directory to keep' }
+        $r.Detail   = if ($survived.Count) { "could not remove: $($survived -join ', ')" }
+                      elseif ($hadLogs)    { "removed the payload, kept $logsDir" }
+                      else                 { 'removed the payload; there was no logs directory to keep' }
         return $r
     }
 

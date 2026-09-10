@@ -767,6 +767,30 @@ It 'Get-PMNewestWriteUtc reports the newest file, not the directory stamp' {
         return ($newest -gt (Get-Date).ToUniversalTime().AddDays(-1))
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
+It 'reports the NEWEST file even when an older one is enumerated first' {
+    # Without a cutoff the early exit used to fire on the first file seen, so this returned
+    # whichever file the filesystem handed over first. Production always passes -NewerThanUtc and
+    # was unaffected; every caller that omitted it was quietly getting the wrong answer.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw3-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        foreach ($n in @('a-old.txt', 'b-new.txt')) { Set-Content -LiteralPath (Join-Path $d $n) -Value 'x' -Encoding UTF8 }
+        (Get-Item -LiteralPath (Join-Path $d 'a-old.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-100)
+        $want = (Get-Date).ToUniversalTime().AddDays(-2)
+        (Get-Item -LiteralPath (Join-Path $d 'b-new.txt')).LastWriteTimeUtc = $want
+        $got = Get-PMNewestWriteUtc -Path $d
+        return ([math]::Abs(($got - $want).TotalSeconds) -lt 2)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and still stops early when the caller supplies a cutoff it has already beaten' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw4-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $d 'fresh.txt') -Value 'x' -Encoding UTF8
+        $cut = (Get-Date).ToUniversalTime().AddDays(-14)
+        return ((Get-PMNewestWriteUtc -Path $d -NewerThanUtc $cut) -gt $cut)
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
 It 'an empty directory dates from itself rather than reading as ancient' {
     $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Path $d -Force | Out-Null
@@ -1328,6 +1352,9 @@ It 'the forbidden PATH pattern list is exactly what ships' {
         '^[A-Za-z]:\\Windows($|\\)'
         '^[A-Za-z]:\\Program Files( \(x86\))?($|\\)'
         '^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|Pictures|Videos|Music|Downloads)($|\\)'
+        '^[A-Za-z]:\\Users\\?$'
+        '^[A-Za-z]:\\Users\\[^\\]+\\?$'
+        '^[A-Za-z]:\\Users\\[^\\]+\\AppData(\\(Local|LocalLow|Roaming))?\\?$'
         '^[A-Za-z]:\\Users\\[^\\]+\\OneDrive[^\\]*($|\\)'
         '\\AppData\\Roaming\\(\.ssh|\.aws|\.azure|\.kube|\.gnupg|Microsoft\\Crypto|Microsoft\\Protect)($|\\)'
         '\\\.ssh($|\\)'
@@ -1399,6 +1426,108 @@ foreach ($cell in @(@{ I = $true; Want = $true }, @{ I = $false; Want = $false }
             return (((Get-Content $o -Raw) -match 'INFERRED USER') -eq $c.Want)
         } finally { Remove-Item -LiteralPath $o -Force -ErrorAction SilentlyContinue }
     }
+}
+
+Write-Host "`n== unknown age must read as JUST TOUCHED, never as ancient ==" -ForegroundColor Cyan
+# The bug this pins: an unreadable tree fell through to the directory's OWN timestamp, which is
+# effectively its creation date. A live session behind a Deny ACE measured 200.0 idle days and
+# became a delete candidate in the one module with AutoApply.
+It 'a tree that cannot be read is dated as just touched, not by its own stamp' {
+    $d = New-PMUnreadableDir
+    if (-not $d) { return 'SKIP' }
+    try {
+        (Get-Item -LiteralPath $d).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-200)
+        Clear-PMReadErrors
+        $newest = Get-PMNewestWriteUtc -Path $d
+        $idle = ((Get-Date).ToUniversalTime() - $newest).TotalDays
+        # Under a 14-day floor this must be spared, and the failure must still be RECORDED -
+        # sparing silently would just move the dishonesty somewhere else.
+        ($idle -lt 1) -and ((Get-PMReadErrorCount) -gt 0)
+    } finally { Remove-PMUnreadableDir $d }
+}
+It 'a PARTIAL read is treated the same way, because the unseen files may be the newer ones' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-part-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $sub = Join-Path $d 'unreadable'
+    New-Item -ItemType Directory -Path $sub -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $d 'old.txt') -Value 'x' -Encoding UTF8
+    (Get-Item -LiteralPath (Join-Path $d 'old.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-200)
+    $ok = $false
+    try {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl = Get-Acl -LiteralPath $sub
+        $acl.SetAccessRuleProtection($true, $true)
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            $me, [Security.AccessControl.FileSystemRights]::ListDirectory,
+            'ContainerInherit,ObjectInherit', 'None', 'Deny')))
+        Set-Acl -LiteralPath $sub -AclObject $acl -ErrorAction Stop
+        $ok = $true
+    } catch { }
+    try {
+        if (-not $ok) { return 'SKIP' }
+        Clear-PMReadErrors
+        $newest = Get-PMNewestWriteUtc -Path $d
+        # The readable half says 200 days idle. The unreadable half could hold a file from a
+        # second ago, so the honest answer is "do not know", which must resolve to recent.
+        (((Get-Date).ToUniversalTime() - $newest).TotalDays -lt 1)
+    } finally {
+        $null = icacls $sub /reset /T /C 2>&1
+        Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`n== the uninstaller refuses without throwing past its own refusal ==" -ForegroundColor Cyan
+foreach ($bad in @('C:\', 'C:', 'C:\Users\Admin', 'C:\Users\Admin\AppData', 'C:\Users\Admin\AppData\Local', 'C:\Users')) {
+    $b = $bad
+    It "refuses -PayloadRoot '$b' and returns a result object" {
+        # Every one of these used to be a live hazard. 'C:\' and 'C:' threw out of the function
+        # entirely - Split-Path returns '' for the first and throws for the second, and
+        # [string[]]$Roots rejects an empty element at BIND time - so the caller's Blocked check
+        # never ran and the uninstaller printed "uninstall complete" and exited 0. The profile
+        # paths simply passed MinDepth 2 and would have been deleted recursively.
+        $r = Remove-PMPayloadFiles -Root $b
+        ($null -ne $r) -and $r.Blocked -and (-not $r.Removed)
+    }
+}
+It 'and still accepts a real payload root' {
+    $fx = New-PMFixtureRoot 'pm-ok-'
+    try {
+        $r = Remove-PMPayloadFiles -Root $fx
+        (-not $r.Blocked)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'reports Removed = false when something survives the delete' {
+    # Removed was the constant $true while the deletes ran under -EA SilentlyContinue, so a
+    # locked file produced "removed the payload" at CHANGE level with the tree still on disk.
+    $fx = New-PMFixtureRoot 'pm-locked-'
+    New-Item -ItemType Directory -Path (Join-Path $fx 'lib') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $fx 'logs') -Force | Out-Null
+    $held = Join-Path $fx 'lib\PMCommon.ps1'
+    Set-Content -LiteralPath $held -Value 'x' -Encoding UTF8
+    $fs = [IO.File]::Open($held, 'Open', 'Read', 'None')
+    try {
+        $r = Remove-PMPayloadFiles -Root $fx -KeepLogs
+        (-not $r.Removed) -and ($r.Detail -like '*could not remove*') -and (Test-Path -LiteralPath $held)
+    } finally {
+        $fs.Dispose()
+        Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "`n== the new container patterns refuse the container, not what is under it ==" -ForegroundColor Cyan
+foreach ($case in @(
+    @{ P = 'C:\Users';                                  N = 'the Users directory';   R = @('C:\') }
+    @{ P = 'C:\Users\Someone';                          N = 'a profile root';        R = @('C:\Users') }
+    @{ P = 'C:\Users\Someone\AppData';                  N = 'AppData';               R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\AppData\Local';            N = 'AppData\Local';         R = @('C:\Users\Someone') }
+    @{ P = 'C:\Users\Someone\AppData\Roaming';          N = 'AppData\Roaming';       R = @('C:\Users\Someone') })) {
+    $k = $case
+    It "refuses $($k.N)" { -not (Test-PMPathSafe -Path $k.P -Roots $k.R) }
+}
+It 'but every module still sweeps freely below them' {
+    # The whole point of anchoring those patterns with $. If this fails the tool has stopped
+    # deleting anything while the suite above stays green.
+    (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\abcd1234.xyz' -Roots @('C:\Users\Someone\AppData\Local\Temp')) -and
+    (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\claude\1111-2222' -Roots @('C:\Users\Someone\AppData\Local\Temp\claude'))
 }
 
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }
