@@ -260,7 +260,17 @@ function Test-PMPayloadSecure {
                  $R::WriteExtendedAttributes -bor $R::Delete -bor
                  $R::DeleteSubdirectoriesAndFiles -bor $R::ChangePermissions -bor $R::TakeOwnership
     # Principals already privileged enough that writing here grants them nothing new.
-    $trusted = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20', 'S-1-5-32-544', 'S-1-5-32-549', 'S-1-3-0')
+    #
+    # LOCAL SERVICE (S-1-5-19) and NETWORK SERVICE (S-1-5-20) were in this list and should not
+    # have been. They are RESTRICTED service accounts, strictly BELOW SystemLocal: a write ACE
+    # for NETWORK SERVICE on a directory the dispatcher dot-sources as SYSTEM is a real
+    # escalation path for a compromised network-facing service, and this check would have
+    # approved it. The comment above was true of SYSTEM and Administrators and was extended to
+    # them by assumption.
+    #
+    # CREATOR OWNER (S-1-3-0) stays: it is a placeholder that only grants rights to whoever
+    # creates a new object, and the owner check below covers the risk it represents.
+    $trusted = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-549', 'S-1-3-0')
     foreach ($ace in $acl.Access) {
         if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
         if (-not ($ace.FileSystemRights -band $dangerous)) { continue }
@@ -274,6 +284,48 @@ function Test-PMPayloadSecure {
         } catch { $sid = [string]$ace.IdentityReference }
         if ($trusted -contains $sid) { continue }
         $bad += ('{0} ({1})' -f $ace.IdentityReference, $ace.FileSystemRights)
+    }
+
+    # THE OWNER, which the DACL does not show. An object's owner always holds implicit
+    # WRITE_DAC - they can rewrite the very ACL this function just approved - so a payload
+    # directory owned by a standard user passes every check above while remaining completely
+    # under their control. Not reachable on the default install, where an elevated New-Item
+    # leaves it owned by Administrators or SYSTEM, but reachable for exactly the hand-copied
+    # payload this function's docstring says it exists to catch.
+    try {
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($trusted -notcontains $ownerSid) {
+            $ownerName = try { $acl.GetOwner([System.Security.Principal.NTAccount]).Value } catch { $ownerSid }
+            $bad += ('owned by {0} - an owner can rewrite this ACL at will' -f $ownerName)
+        }
+    } catch {
+        $bad += "cannot read the owner: $($_.Exception.Message)"
+    }
+    return $bad
+}
+
+function Test-PMPayloadTreeSecure {
+    <#
+        The payload root AND the directories whose contents get executed.
+
+        Test-PMPayloadSecure inspects one directory. That was enough while every ACE was
+        inherited from the root, and not enough in general: the dispatcher dot-sources every
+        .ps1 in lib\ at startup and Invoke-PMModulePhase dot-sources them again inside each
+        phase, so a permissive ACE placed directly on lib\ with inheritance disabled is
+        invisible to a root-only check while being the most valuable place to put one.
+
+        modules\ is included for the same reason - Import-PMModuleInfo reads module.psd1 and
+        the phase runner dot-sources module.ps1.
+
+        Missing subdirectories are not an error here; the caller is asking "is what exists
+        safe", and a payload with no lib\ fails for louder reasons elsewhere.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $bad = @(Test-PMPayloadSecure -Path $Path)
+    foreach ($sub in @('lib', 'modules')) {
+        $p = Join-Path $Path $sub
+        if (-not [IO.Directory]::Exists($p)) { continue }
+        foreach ($b in @(Test-PMPayloadSecure -Path $p)) { $bad += ('{0}\: {1}' -f $sub, $b) }
     }
     return $bad
 }

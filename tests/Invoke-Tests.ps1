@@ -1855,6 +1855,99 @@ function Repair-PMModule {
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== the payload ACL check covers what it claims to (BACKLOG 6j) ==" -ForegroundColor Cyan
+function New-PMAclProbe {
+    param([string]$Sub)
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-6j-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $target = if ($Sub) { Join-Path $d $Sub } else { $d }
+    New-Item -ItemType Directory -Path $target -Force | Out-Null
+    return @{ Root = $d; Target = $target }
+}
+function Add-PMWriteAce {
+    # An explicit Allow-write ACE for a given SID. Granting on a directory you own needs no
+    # elevation, which is what lets these run in a normal shell.
+    param([string]$Path, [string]$Sid)
+    try {
+        $acl = Get-Acl -LiteralPath $Path
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($Sid)),
+            [Security.AccessControl.FileSystemRights]::Write,
+            'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+It 'NETWORK SERVICE with write access is refused, not trusted' {
+    # S-1-5-20 and S-1-5-19 were on the trusted list under a comment saying they are "already
+    # privileged enough that writing here grants them nothing new". True of SYSTEM; false of
+    # these - they are RESTRICTED service accounts strictly below SYSTEM, so a write ACE here
+    # is a genuine escalation path for a compromised network-facing service.
+    $probe = New-PMAclProbe
+    try {
+        if (-not (Add-PMWriteAce -Path $probe.Target -Sid 'S-1-5-20')) { return 'SKIP' }
+        @(Test-PMPayloadSecure -Path $probe.Target | Where-Object { $_ -match 'NETWORK SERVICE|S-1-5-20' }).Count -gt 0
+    } finally { Remove-Item -LiteralPath $probe.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and SYSTEM with write access is still fine' {
+    # The positive control. Without it, a check that refused everything would pass the test
+    # above while making every correctly hardened install unrunnable.
+    $probe = New-PMAclProbe
+    try {
+        $null = Add-PMWriteAce -Path $probe.Target -Sid 'S-1-5-18'
+        @(Test-PMPayloadSecure -Path $probe.Target | Where-Object { $_ -match 'S-1-5-18|SYSTEM' }).Count -eq 0
+    } finally { Remove-Item -LiteralPath $probe.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'an owner outside the trusted set is reported, because an owner can rewrite the ACL' {
+    # The DACL does not show this. An object's owner always holds implicit WRITE_DAC, so a
+    # payload owned by a standard user passes every ACE check while staying entirely under
+    # their control.
+    $probe = New-PMAclProbe
+    try {
+        $owner = (Get-Acl -LiteralPath $probe.Target).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        # Elevated, New-Item leaves this owned by Administrators, which is legitimately trusted
+        # and there is nothing to assert.
+        if ($owner -in @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-549', 'S-1-3-0')) { return 'SKIP' }
+        @(Test-PMPayloadSecure -Path $probe.Target | Where-Object { $_ -like '*owned by*' }).Count -gt 0
+    } finally { Remove-Item -LiteralPath $probe.Root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'the tree check sees a permissive ACE on lib\ that a root-only check cannot' {
+    # The gap that mattered most: the dispatcher dot-sources every .ps1 under lib\ at startup
+    # and Invoke-PMModulePhase does it again per phase, so lib\ with inheritance disabled and
+    # its own Allow-write ACE is the most valuable place to plant one - and was invisible.
+    $probe = New-PMAclProbe -Sub 'lib'
+    try {
+        # BOTH changes in ONE Set-Acl. Splitting them - protect, write, then add the ACE and
+        # write again - fails unelevated: the second write needs SeSecurityPrivilege. Same trap
+        # this suite already documents for removing a Deny ACE, and it turned this test into a
+        # permanent SKIP, which is the "verifies nothing" outcome the suite exists to avoid.
+        $ok = $true
+        try {
+            $acl = Get-Acl -LiteralPath $probe.Target
+            $acl.SetAccessRuleProtection($true, $true)   # stop inheriting, so the ACE is lib's own
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier('S-1-5-20')),
+                [Security.AccessControl.FileSystemRights]::Write,
+                'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $probe.Target -AclObject $acl -ErrorAction Stop
+        } catch { $ok = $false }
+        if (-not $ok) { return 'SKIP' }
+        $tree = @(Test-PMPayloadTreeSecure -Path $probe.Root)
+        $rootOnly = @(Test-PMPayloadSecure -Path $probe.Root)
+        # Found by the tree walk, attributed to lib\, and NOT visible to the root-only check.
+        (@($tree | Where-Object { $_ -like 'lib\*' -and $_ -match 'NETWORK SERVICE|S-1-5-20' }).Count -gt 0) -and
+        (@($rootOnly | Where-Object { $_ -match 'NETWORK SERVICE|S-1-5-20' }).Count -eq 0)
+    } finally {
+        $null = icacls $probe.Target /reset /T /C 2>&1
+        Remove-Item -LiteralPath $probe.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+It 'and the real deployed payload still passes, so this cannot lock us out' {
+    # A hardening change that refuses the live install is an outage, not a fix.
+    if (-not (Test-Path -LiteralPath 'C:\ProgramData\PcMaintenance')) { return 'SKIP' }
+    @(Test-PMPayloadTreeSecure -Path 'C:\ProgramData\PcMaintenance').Count -eq 0
+}
+
 Write-Host "`n== size and age must describe the SAME thing a deletion would act on ==" -ForegroundColor Cyan
 It 'a reparse-point root is dated from the LINK, not from the tree behind it' {
     # BACKLOG 6g. Get-PMPathSize always returned 0 for a junction, because deleting one removes

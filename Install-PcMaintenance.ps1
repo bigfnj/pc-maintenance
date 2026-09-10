@@ -117,7 +117,7 @@ try {
     Write-PMLog 'the dispatcher will refuse to run until this is fixed' 'ERROR'
     exit 1
 }
-$stillOpen = @(Test-PMPayloadSecure -Path $PayloadRoot)
+$stillOpen = @(Test-PMPayloadTreeSecure -Path $PayloadRoot)
 if ($stillOpen.Count) {
     Write-PMLog 'ACL hardening did not take effect:' 'ERROR'
     foreach ($b in $stillOpen) { Write-PMLog "  $b" 'ERROR' }

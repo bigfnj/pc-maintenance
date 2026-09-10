@@ -86,7 +86,7 @@ catch {
 # file that a high-privileged process then executes. A normal user running this by hand out of a
 # directory that same user owns gains nothing they did not already have, and refusing there would
 # only push people toward a bypass switch - which would then be the hole.
-$insecure = if (Test-PMElevated) { @(Test-PMPayloadSecure -Path $PayloadRoot) } else { @() }
+$insecure = if (Test-PMElevated) { @(Test-PMPayloadTreeSecure -Path $PayloadRoot) } else { @() }
 if ($insecure.Count) {
     Write-PMLog "REFUSING TO RUN: $PayloadRoot is writable by a non-administrator." 'ERROR'
     foreach ($b in $insecure) { Write-PMLog "  $b" 'ERROR' }

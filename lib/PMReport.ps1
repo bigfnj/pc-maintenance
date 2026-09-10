@@ -155,11 +155,22 @@ function Get-PMTileRows {
 $script:PMTileSpec = @(
     @{ Kind = 'total';      Label = 'Modules run';    Blurb = 'Every module in the manifest, and how each one finished.' }
     @{ Kind = 'clean';      Label = 'Clean';          Blurb = 'Looked, found nothing to remove.' }
-    @{ Kind = 'found';      Label = 'Found';          Blurb = 'Found something and left it alone, because this run or this module is not allowed to act.' }
+    # 'Left alone', not 'Found'. This tile counts modules with status 'reported' - found and
+    # NOT acted on - while the run JSON's summary.found counts every module that found
+    # something, including the ones that then deleted it. Two different quantities under one
+    # word, which on an apply run reads as JSON found:3 beside a tile showing 0.
+    #
+    # Renaming rather than changing either number: the tile's meaning is the more useful of
+    # the two next to 'Cleaned up', and summary.found is a published field in a log format
+    # that is retained 50 runs deep and diffed week to week.
+    @{ Kind = 'found';      Label = 'Left alone';     Blurb = 'Found something and left it where it was, because this run or this module is not allowed to act. The run JSON counts these plus anything cleaned up in its own summary.found.' }
     @{ Kind = 'applied';    Label = 'Cleaned up';     Blurb = 'Actually deleted something.' }
     @{ Kind = 'skipped';    Label = 'Skipped';        Blurb = 'Did not run at all: the category is not permitted, or it needs a logged-on user and there was none.' }
     @{ Kind = 'unverified'; Label = 'Could not check'; Blurb = 'Could not read the place it is responsible for, so "clean" would have been a guess. This is why the run reports failure.' }
-    @{ Kind = 'partial';    Label = "Couldn't read";  Blurb = 'Individual spots that were locked or access-denied while scanning. The rest of the sweep is still valid; these are simply not covered.' }
+    # Same shape of mismatch, smaller: this lists DISTINCT messages, capped at ten, while
+    # summary.partial is the total number of failed reads. Ten rows under a JSON figure of
+    # 4,000 is correct and looks wrong unless the blurb says so.
+    @{ Kind = 'partial';    Label = "Couldn't read";  Blurb = 'Individual spots that were locked or access-denied while scanning. The rest of the sweep is still valid; these are simply not covered. Shown as distinct messages, at most ten; the run JSON reports the full count in summary.partial.' }
     @{ Kind = 'errors';     Label = 'Errors';         Blurb = 'A module threw, or its removal was refused by the path guard.' }
 )
 

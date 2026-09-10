@@ -109,7 +109,13 @@ Every run writes `logs/run-<id>.json` plus a self-contained HTML dashboard named
 from that user's own shell-folder registration rather than assuming `<profile>\Downloads` (it is
 commonly redirected). Self-contained means no CDN, no webfont and no JS library: the file is
 opened offline, possibly months later, and a test asserts the output contains no external fetch.
-It renders from the same object as the JSON, so the two can never disagree.
+It renders from the same object as the JSON, so neither can describe a run the other did not
+see. That is not the same as every number matching, and two deliberately do not: the **Left
+alone** tile counts what was found and *not* acted on, where the JSON's `summary.found` counts
+everything found including what was then cleaned up, and **Couldn't read** lists distinct
+messages capped at ten where `summary.partial` is the total. Both tiles say so. Each tile's
+number is always exactly the number of rows it opens to - that promise is kept by construction,
+since the count *is* the row count.
 
 **Every number opens.** Each stat tile is a `<details>` element: click or tab to it and it expands
 to the rows it counted, with a sentence explaining what that number means. A count nobody can
