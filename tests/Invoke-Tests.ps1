@@ -32,6 +32,26 @@ function New-PMFixtureRoot {
     if (Test-PMElevated) { Set-PMPayloadAcl -Path $fx }
     return $fx
 }
+
+function Get-PMAutoApplyModuleNames {
+    <#
+        Which modules would the SHIPPED gate actually let delete on an -Apply run?
+
+        Two tests answered this with `[bool](Import-PMModuleInfo ...)['AutoApply']`, which is the
+        exact predicate Test-PMApplyAllowed was rewritten to STOP using: Import-PowerShellDataFile
+        preserves the string type and [bool]'false' is $true under 5.1. So a psd1 written with
+        JSON habits dropped that module to report-only in production while both tests went on
+        listing it as allowed to act - the suite agreeing with itself about a rule it no longer
+        shared with the code.
+
+        One helper, calling the real gate, so the two enumerations cannot drift from each other
+        or from the dispatcher again.
+    #>
+    param([Parameter(Mandatory)][string]$ModulesDir)
+    @(Get-ChildItem -LiteralPath $ModulesDir -Directory |
+        Where-Object { Test-PMApplyAllowed -Apply $true -ModuleInfo (Import-PMModuleInfo -ModuleDir $_.FullName) } |
+        ForEach-Object { $_.Name } | Sort-Object)
+}
 $script:Pass = 0; $script:Fail = 0; $script:Skip = 0
 # When this run began. The teardown at the bottom only sweeps fixtures created after this
 # instant, which keeps it off anything left by an earlier run or another tool.
@@ -159,8 +179,38 @@ It 'every module category is permitted by the shipped manifest' {
     return $true
 }
 It 'exactly the three proven-mechanical modules declare AutoApply' {
-    $auto = @($modDirs | Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } | ForEach-Object { $_.Name } | Sort-Object)
+    $auto = Get-PMAutoApplyModuleNames -ModulesDir (Join-Path $root 'modules')
     return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
+}
+It "a psd1 whose AutoApply is the STRING 'false' is not in the allowed set" {
+    # The fixture is the whole test. All four shipped psd1 files use real booleans, so the
+    # discarded `[bool]$info['AutoApply']` predicate and Test-PMApplyAllowed agree on every one
+    # of them - the enumeration above cannot tell them apart and never could. Only a psd1 that
+    # writes AutoApply the way JSON would does, and under 5.1 [bool]'false' is True: the old
+    # predicate promotes this module to "allowed to act" while the dispatcher holds it to
+    # report-only. Pinned here so nobody re-inlines the cast for brevity.
+    $fx = Join-Path ([IO.Path]::GetTempPath()) ("pm-strauto-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $md = Join-Path $fx 'modules\stringy'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    try {
+        @(
+            '@{'
+            "    Id = 'stringy'; Name = 'S'; Category = 'maintenance'; Version = '1.0.0'"
+            '    RequiresUserSid = $false'
+            "    AutoApply = 'false'"
+            "    Roots = @('C:\nowhere')"
+            "    Entry = 'module.ps1'; Description = 'fixture'"
+            '}'
+        ) | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+        $mods = Join-Path $fx 'modules'
+        # Both halves matter. The first is the assertion; the second proves the fixture is not
+        # degenerate - that the old predicate really does disagree here, so a green result is
+        # evidence about the gate rather than about a psd1 nothing could get wrong.
+        $old = @(Get-ChildItem -LiteralPath $mods -Directory |
+                 Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] })
+        return (((Get-PMAutoApplyModuleNames -ModulesDir $mods) -notcontains 'stringy') -and
+                (@($old).Count -eq 1))
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'every module in the manifest exists on disk' {
     $m = Get-PMManifest -Path (Join-Path $root 'pcmaintenance.manifest.json')
@@ -498,6 +548,25 @@ It 'and acts normally once that user is confirmed' {
     # while stopping the tool deleting anything at all.
     Test-PMActingUserConfirmed -RequiresUserSid $false -LoggedIn $true
 }
+It 'the reported reason names whether the module declared RequiresUserSid' {
+    # Makes the claim two comments up true. "The flag is still taken so the reason can be
+    # reported accurately" was written in both docstrings and realised in neither: the dispatcher
+    # set ONE fixed string, so the run JSON - this project's substitute for a backup, and the
+    # only record of why a sweep did nothing - described the plain rule and the deliberately
+    # conservative extension in identical words.
+    $yes = Get-PMActingUserHoldBack -RequiresUserSid $true
+    $no  = Get-PMActingUserHoldBack -RequiresUserSid $false
+    # Different, and each one actually mentions the flag - two strings that merely differ could
+    # still both be silent about the thing the docstring promises they report.
+    return (($yes -ne $no) -and ($yes -match 'RequiresUserSid') -and ($no -match 'RequiresUserSid'))
+}
+It 'and the dispatcher reports that reason instead of a fixed string' {
+    # Source-level on purpose: $holdBack is only ever set on an -Apply run against a GUESSED
+    # user, which this box cannot produce because somebody is signed in. Pins that the dispatcher
+    # ASKS - re-inlining a literal here is exactly how the docstring went stale the first time.
+    $src = Get-Content -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Raw
+    return ($src -match '\$holdBack\s*=\s*Get-PMActingUserHoldBack -RequiresUserSid')
+}
 
 Write-Host "`n== the payload must not be writable by a non-admin ==" -ForegroundColor Cyan
 It 'a user-writable directory is reported as insecure' {
@@ -523,9 +592,16 @@ It 'a hardened directory passes the same check' {
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'the deployed payload is not writable by a non-admin' {
-    # The live install, not a fixture. Skips cleanly when nothing is deployed.
+    # The live install, not a fixture.
     $deployed = 'C:\ProgramData\PcMaintenance'
-    if (-not (Test-Path -LiteralPath $deployed)) { return $true }
+    # SKIP, not $true. `return $true` counted "nothing is deployed" as "what is deployed is
+    # hardened" - a green line about a payload that does not exist. The identical precondition
+    # further down this file already writes 'SKIP', so the two spellings disagreed about the same
+    # situation, and the It docstring at the top says outright that a check reporting success
+    # while verifying nothing is the exact failure this suite exists to catch.
+    # Latent on any box that HAS the payload, which is why it survived: it only ever lied on a
+    # machine where the answer mattered most.
+    if (-not (Test-Path -LiteralPath $deployed)) { return 'SKIP' }
     return (@(Test-PMPayloadSecure -Path $deployed).Count -eq 0)
 }
 
@@ -788,14 +864,14 @@ It 'ignores a directory whose name is not a session GUID' {
     try { return ((Get-PMAgentPicks -Root $r) -notcontains 'not-a-session') }
     finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
-It 'Get-PMNewestWriteUtc reports the newest file, not the directory stamp' {
+It 'tree age reports the newest file, not the directory stamp' {
     $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw-" + [guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Path (Join-Path $d 'deep') -Force | Out-Null
     try {
         $f = Join-Path $d 'deep\fresh.txt'
         Set-Content -LiteralPath $f -Value 'x' -Encoding UTF8
         (Get-Item -LiteralPath $d).LastWriteTime = (Get-Date).AddDays(-60)
-        $newest = Get-PMNewestWriteUtc -Path $d
+        $newest = Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d) -Path $d
         return ($newest -gt (Get-Date).ToUniversalTime().AddDays(-1))
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
@@ -810,7 +886,7 @@ It 'reports the NEWEST file even when an older one is enumerated first' {
         (Get-Item -LiteralPath (Join-Path $d 'a-old.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-100)
         $want = (Get-Date).ToUniversalTime().AddDays(-2)
         (Get-Item -LiteralPath (Join-Path $d 'b-new.txt')).LastWriteTimeUtc = $want
-        $got = Get-PMNewestWriteUtc -Path $d
+        $got = Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d) -Path $d
         return ([math]::Abs(($got - $want).TotalSeconds) -lt 2)
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
@@ -820,19 +896,17 @@ It 'and still stops early when the caller supplies a cutoff it has already beate
     try {
         Set-Content -LiteralPath (Join-Path $d 'fresh.txt') -Value 'x' -Encoding UTF8
         $cut = (Get-Date).ToUniversalTime().AddDays(-14)
-        return ((Get-PMNewestWriteUtc -Path $d -NewerThanUtc $cut) -gt $cut)
+        return ((Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d -NewerThanUtc $cut) -Path $d) -gt $cut)
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'an empty directory dates from itself rather than reading as ancient' {
     $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-nw2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
     New-Item -ItemType Directory -Path $d -Force | Out-Null
-    try { return ((Get-PMNewestWriteUtc -Path $d) -gt (Get-Date).ToUniversalTime().AddDays(-1)) }
+    try { return ((Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d) -Path $d) -gt (Get-Date).ToUniversalTime().AddDays(-1)) }
     finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'agent-scratchpads is now one of three modules allowed to act' {
-    $auto = @(Get-ChildItem (Join-Path $script:RepoRoot 'modules') -Directory |
-        Where-Object { [bool](Import-PMModuleInfo -ModuleDir $_.FullName)['AutoApply'] } |
-        ForEach-Object { $_.Name } | Sort-Object)
+    $auto = Get-PMAutoApplyModuleNames -ModulesDir (Join-Path $script:RepoRoot 'modules')
     return (($auto -join ',') -eq 'agent-scratchpads,plex-bif-orphans,vs-installer-scratch')
 }
 
@@ -1487,7 +1561,7 @@ It 'a tree that cannot be read is dated as just touched, not by its own stamp' {
     try {
         (Get-Item -LiteralPath $d).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-200)
         Clear-PMReadErrors
-        $newest = Get-PMNewestWriteUtc -Path $d
+        $newest = Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d) -Path $d
         $idle = ((Get-Date).ToUniversalTime() - $newest).TotalDays
         # Under a 14-day floor this must be spared, and the failure must still be RECORDED -
         # sparing silently would just move the dishonesty somewhere else.
@@ -1514,7 +1588,7 @@ It 'a PARTIAL read is treated the same way, because the unseen files may be the 
     try {
         if (-not $ok) { return 'SKIP' }
         Clear-PMReadErrors
-        $newest = Get-PMNewestWriteUtc -Path $d
+        $newest = Resolve-PMTreeAge -Stat (Get-PMTreeStat -Path $d) -Path $d
         # The readable half says 200 days idle. The unreadable half could hold a file from a
         # second ago, so the honest answer is "do not know", which must resolve to recent.
         (((Get-Date).ToUniversalTime() - $newest).TotalDays -lt 1)
@@ -1658,7 +1732,12 @@ It 'Bytes sums the whole tree, and equals what Get-PMPathSize reports' {
         ($st.Bytes -eq 600) -and ((Get-PMPathSize -Path $t) -eq 600) -and $st.Complete -and -not $st.Blind
     } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
 }
-It 'NewestUtc finds the deepest-written file, and equals Get-PMNewestWriteUtc' {
+It 'NewestUtc finds the deepest-written file, not the shallowest' {
+    # There used to be a second conjunct asserting this "equals Get-PMNewestWriteUtc". It could
+    # not fail independently: that was a two-line wrapper over the SAME Get-PMTreeStat call, and
+    # Resolve-PMTreeAge returns $Stat.NewestUtc verbatim for a tree that is readable and not
+    # empty - which this fixture is. The name promised agreement between two implementations
+    # where there was only ever one. Dropped with the wrapper itself (BACKLOG 7c/7d).
     $t = New-PMStatTree
     try {
         $want = (Get-Date).ToUniversalTime().AddDays(-3)
@@ -1666,8 +1745,7 @@ It 'NewestUtc finds the deepest-written file, and equals Get-PMNewestWriteUtc' {
         (Get-Item -LiteralPath (Join-Path $t 'sub\b.txt')).LastWriteTimeUtc = (Get-Date).ToUniversalTime().AddDays(-50)
         (Get-Item -LiteralPath (Join-Path $t 'sub\deeper\c.txt')).LastWriteTimeUtc = $want
         $st = Get-PMTreeStat -Path $t
-        ([math]::Abs(($st.NewestUtc - $want).TotalSeconds) -lt 2) -and
-        ([math]::Abs(((Get-PMNewestWriteUtc -Path $t) - $want).TotalSeconds) -lt 2)
+        ([math]::Abs(($st.NewestUtc - $want).TotalSeconds) -lt 2)
     } finally { Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue }
 }
 It 'an early exit marks Complete false, so Bytes is never read as a total' {

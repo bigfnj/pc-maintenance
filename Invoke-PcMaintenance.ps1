@@ -157,10 +157,15 @@ try {
             # reports LoggedIn=$false. That is fine for reporting - a wrong number is visible and
             # harmless - and not fine for removal, which on a multi-profile machine with nobody
             # signed in would delete inside a stranger's Temp.
-            if ($mayApply -and -not (Test-PMActingUserConfirmed -RequiresUserSid ([bool]$info['RequiresUserSid']) -LoggedIn ([bool]$user.LoggedIn))) {
+            $needsUser = [bool]$info['RequiresUserSid']
+            if ($mayApply -and -not (Test-PMActingUserConfirmed -RequiresUserSid $needsUser -LoggedIn ([bool]$user.LoggedIn))) {
                 $mayApply = $false
-                $holdBack = 'the interactive user was inferred, not confirmed logged on'
-                Write-PMLog "$modId will report only - interactive user was inferred, not confirmed" 'SKIP'
+                # Asked for, never re-inlined. This was a fixed string that named neither the
+                # module's flag nor which of the two rules held it back, which left
+                # Test-PMActingUserConfirmed's docstring claiming a reporting accuracy nothing
+                # delivered. The reason lives beside that gate so the two cannot drift.
+                $holdBack = Get-PMActingUserHoldBack -RequiresUserSid $needsUser
+                Write-PMLog "$modId will report only - $holdBack" 'SKIP'
             }
 
             # Declared roots, expanded against the INTERACTIVE user and junction-resolved. The

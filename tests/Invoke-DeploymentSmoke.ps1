@@ -116,7 +116,20 @@ Check 'and a real write into lib\ is actually refused' {
     if (Test-PMElevated) { return 'SKIP' }
     $probe = Join-Path $PayloadRoot 'lib\smoke-probe.tmp'
     try { Set-Content -LiteralPath $probe -Value 'x' -ErrorAction Stop }
-    catch { return $true }
+    catch {
+        # ONLY "the kernel said no" is a pass. This was `catch { return $true }`, which passed on
+        # ANY exception - and the one that matters most is the wrong one: with no lib\ deployed at
+        # all, Set-Content throws System.IO.DirectoryNotFoundException (measured against an empty
+        # -PayloadRoot: FullyQualifiedErrorId GetContentWriterDirectoryNotFoundError), so a
+        # MISSING payload reported as a hardened one - the exact "silence looks like emptiness"
+        # failure this file exists to catch, committed by the file itself.
+        # A genuine refusal is System.UnauthorizedAccessException (measured against the live
+        # payload unelevated: GetContentWriterUnauthorizedAccessError). Anything else means the
+        # probe never reached the ACL, which is a SKIP, not evidence.
+        if ($_.Exception -is [UnauthorizedAccessException]) { return $true }
+        Write-Host ("       probe never reached the ACL: {0}" -f $_.Exception.GetType().Name) -ForegroundColor DarkGray
+        return 'SKIP'
+    }
     Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
     return $false
 }

@@ -27,7 +27,12 @@ function Get-PlexMediaRoot {
 }
 
 function Get-PlexOrphanCandidates {
-    param([Parameter(Mandatory)][hashtable]$Context, [hashtable]$KnownSizes)
+    # No -KnownSizes here, unlike the other three modules - do not re-add it when cloning this
+    # file. Their candidates are DIRECTORIES, so Get-PMKnownOrMeasuredSize earns its keep by
+    # avoiding a measuring walk on a cache miss. These candidates are FILES: $f.Length below is
+    # already free off the enumeration's own WIN32_FIND_DATA, so a size map would only ever be
+    # a slower way of reading a number the walk has in hand.
+    param([Parameter(Mandatory)][hashtable]$Context)
     $root = Get-PlexMediaRoot -Context $Context
     if (-not (Test-PMPath -Path $root)) { return @() }
     # ONE walk, unfiltered, into a set. Two reasons beyond speed:
@@ -84,15 +89,14 @@ function Test-PMModule {
 function Repair-PMModule {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root  = Get-PlexMediaRoot -Context $Context
-    $items = @(Get-PlexOrphanCandidates -Context $Context -KnownSizes $Context.KnownSizes)
+    $items = @(Get-PlexOrphanCandidates -Context $Context)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes saves the walk inside Remove-PMPath, and the size itself now comes from
-        # Test via $Context.KnownSizes rather than being measured again here. Re-deriving the
+        # KnownBytes saves the walk inside Remove-PMPath, and the size itself rides along on the
+        # candidate as $f.Length rather than being measured again here. Re-deriving the
         # candidate LIST is still deliberate - it re-applies every selection rule at delete
         # time, which is what spares a path that became active in between - but re-measuring
-        # it was pure waste. A candidate that appeared since Test is absent from the map and
-        # gets measured normally.
+        # it was pure waste.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }

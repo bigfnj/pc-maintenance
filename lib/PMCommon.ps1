@@ -574,10 +574,11 @@ function Get-PMTreeStat {
         the age walk never took its early exit for exactly the paths whose size was then wanted.
         So every selected candidate was walked twice, in full, for data one pass already had.
 
-        Deliberately returns FACTS, not decisions. The root policies of the two callers genuinely
+        Deliberately returns FACTS, not decisions. The root policies of the two readers genuinely
         differ - Get-PMPathSize returns 0 for a reparse-point root because deletion frees nothing
-        there, while Get-PMNewestWriteUtc has never checked its root at all (BACKLOG 6g) - so
-        folding that policy in here would silently change one of them. The wrappers keep their own.
+        there, while the age reader wants the LINK's own stamp rather than the target's tree
+        (BACKLOG 6g) - so folding either policy in here would silently change the other.
+        Get-PMPathSize and Resolve-PMTreeAge each keep their own.
 
         Reads .Length off the enumeration's own WIN32_FIND_DATA rather than re-stat'ing every
         file: measured 25 ms against 78 ms for Get-ChildItem -Recurse | Measure-Object on a real
@@ -700,37 +701,30 @@ function Get-PMPathSize {
     return [int64]$st.Bytes
 }
 
-function Get-PMNewestWriteUtc {
-    <#
-        The newest LastWriteTimeUtc of any file anywhere under $Path.
-
-        A directory's own mtime is not the age of its contents. Windows updates it only when
-        entries are added to or removed from THAT directory, not when a file deeper in the tree is
-        written. Measured on a live agent session directory: the root said 06:01 while the newest
-        file inside said 14:29, an 8.5 hour lag on a session that was actively running.
-
-        Any rule that deletes "directories older than N days" by directory mtime will therefore
-        eventually delete something that is still in use. That is survivable while a module only
-        reports, and not survivable once it acts.
-
-        -NewerThanUtc lets the caller stop the walk the moment it finds anything newer, which is
-        what keeps this cheap: an active directory exits after one file, and only genuinely idle
-        directories are walked in full.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [datetime]$NewerThanUtc = [datetime]::MinValue,
-        [switch]$Critical
-    )
-    $st = Get-PMTreeStat -Path $Path -NewerThanUtc $NewerThanUtc -Critical:$Critical
-    return (Resolve-PMTreeAge -Stat $st -Path $Path)
-}
-
 function Resolve-PMTreeAge {
     <#
         Turn a Get-PMTreeStat result into the age answer, with the two not-knowing cases kept
         distinct. Shared so a caller that already has a Stat does not have to re-derive - and
         cannot get it subtly different.
+
+        WHAT "AGE" MEANS HERE, and why it is not the obvious thing. This prose moved in from
+        Get-PMNewestWriteUtc, a wrapper deleted for having zero production callers; the wrapper
+        was expendable, the measurement is not.
+
+        The age of a tree is the newest LastWriteTimeUtc of any FILE anywhere under it, never the
+        directory's own stamp. A directory's mtime is not the age of its contents: Windows updates
+        it only when entries are added to or removed from THAT directory, not when a file deeper
+        in the tree is written. Measured on a live agent session directory - the root said 06:01
+        while the newest file inside said 14:29, an 8.5 hour lag on a session that was actively
+        running.
+
+        Any rule that deletes "directories older than N days" by directory mtime will therefore
+        eventually delete something that is still in use. That is survivable while a module only
+        reports, and not survivable once it acts - and agent-scratchpads acts.
+
+        There is exactly ONE place below where the directory's own stamp is used, and it is the
+        empty-tree case: nothing failed, there is simply no file to date it. That is the exception
+        the rule leaves room for, not a relapse into it.
     #>
     param([Parameter(Mandatory)][hashtable]$Stat, [Parameter(Mandatory)][string]$Path)
 

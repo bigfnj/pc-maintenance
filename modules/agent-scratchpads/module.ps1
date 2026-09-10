@@ -56,9 +56,9 @@ function Get-AgentScratchCandidates {
         # ONE walk for both answers. Stops the moment it finds anything newer than the cutoff, so
         # an active session costs one file read and only genuinely idle ones are walked in full.
         #
-        # This used to call Get-PMNewestWriteUtc and then Get-PMPathSize, which are the same
-        # traversal - and because a session only becomes a candidate by being IDLE, the age walk
-        # never took its early exit for exactly the paths whose size was then wanted. Every
+        # This used to be two calls - a separate age walk, then Get-PMPathSize - running the same
+        # traversal twice, and because a session only becomes a candidate by being IDLE, the age
+        # walk never took its early exit for exactly the paths whose size was then wanted. Every
         # selected candidate was therefore walked twice, in full. At the measured peak of 933
         # idle sessions over 3.2 GB that is a whole redundant pass over the selected set.
         $stat = Get-PMTreeStat -Path $s.FullName -NewerThanUtc $cutUtc

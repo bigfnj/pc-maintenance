@@ -61,7 +61,8 @@ function Test-PMActingUserConfirmed {
         makes the path guard agree, and the README's fourth condition was quietly opt-in.
 
         Now: nobody deletes for a user who was guessed. $RequiresUserSid is still taken so the
-        reason can be reported accurately, but it no longer decides the answer.
+        reason can be reported accurately - Get-PMActingUserHoldBack below is where that actually
+        happens - but it no longer decides the answer.
 
         The cost is a module that genuinely needs no user - one sweeping ProgramData, say -
         being held to report-only at the logon screen when nobody is signed in. That is the
@@ -71,6 +72,33 @@ function Test-PMActingUserConfirmed {
     #>
     param([Parameter(Mandatory)][bool]$RequiresUserSid, [Parameter(Mandatory)][bool]$LoggedIn)
     return $LoggedIn
+}
+
+function Get-PMActingUserHoldBack {
+    <#
+        WHY Test-PMActingUserConfirmed said no, phrased for the run JSON and the report.
+
+        This is what makes the sentence above honest. It has always claimed $RequiresUserSid is
+        "still taken so the reason can be reported accurately", and it was not: the dispatcher set
+        ONE FIXED string for both cases, so the audit trail recorded two genuinely different
+        decisions in identical words.
+
+          declared   - the module says it works inside a user profile and the profile we have was
+                       guessed out of the registry rather than observed. Refusing is the plain
+                       reading of the rule, and nobody reading the JSON needs it explained.
+          undeclared - the module claims to need no user and is held back anyway. That is the
+                       deliberately conservative extension from BACKLOG 6i: the dispatcher still
+                       expands this module's declared Roots against that same guessed profile, so
+                       "needs no user" is not the same thing as "unaffected by which user we
+                       guessed". It is the surprising arm, and the fixed string made it the
+                       invisible one - the operator saw a refusal whose stated reason did not
+                       apply to their module and had no way to tell that was the point.
+    #>
+    param([Parameter(Mandatory)][bool]$RequiresUserSid)
+    if ($RequiresUserSid) {
+        return 'the module declares RequiresUserSid and the interactive user was inferred, not confirmed logged on'
+    }
+    return 'the interactive user was inferred, not confirmed logged on - held back even though the module does not declare RequiresUserSid, because its declared Roots are still expanded against that guessed profile'
 }
 
 function Test-PMApplyAllowed {

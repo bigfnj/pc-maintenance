@@ -544,7 +544,7 @@ Measured over 14,000 candidates (whole function 3,834 ms): `.Where({...})` 523 m
 real work. Replaced with `String.Split` and an index: 34 ms. The guard runs twice per deletion,
 so a 6,935-file sweep makes 13,870 calls. All 270 tests still pass.
 
-### 7c. A test that cannot fail
+### 7c. ~~A test that cannot fail~~ DONE 2026-09-10
 
 `tests/Invoke-Tests.ps1:1661` - *"NewestUtc finds the deepest-written file, and equals
 Get-PMNewestWriteUtc"*. The second conjunct cannot fail independently of the first:
@@ -552,7 +552,7 @@ Get-PMNewestWriteUtc"*. The second conjunct cannot fail independently of the fir
 conjunct calls, and `Resolve-PMTreeAge` returns `$Stat.NewestUtc` verbatim for the tree the
 fixture builds. The name promises agreement between two implementations; there is one.
 
-### 7d. `Get-PMNewestWriteUtc` is dead in production
+### 7d. ~~`Get-PMNewestWriteUtc` is dead in production~~ DONE 2026-09-10
 
 Zero production call sites; all 8 are in the test suite. Superseded by the fused
 `Get-PMTreeStat` + `Resolve-PMTreeAge` under item 6d, and `agent-scratchpads/module.ps1:59` still
@@ -561,7 +561,7 @@ shipped code that SYSTEM dot-sources. Interlocks with 7c: fixing that test remov
 argument for keeping it. Either delete it and rewrite the 8 call sites against the two functions
 it wraps, or move it into the test file.
 
-### 7e. `$RequiresUserSid` is mandatory, unused, and its docstring explains why it is kept
+### 7e. ~~`$RequiresUserSid` is mandatory, unused, and its docstring explains why it is kept~~ DONE 2026-09-10
 
 `lib/PMManifest.ps1:63-72`. `Test-PMActingUserConfirmed` takes it `[Parameter(Mandatory)]` and
 the entire body is `return $LoggedIn`. The docstring says it is "still taken so the reason can be
@@ -569,7 +569,7 @@ reported accurately" - but the only production caller sets a fixed `$holdBack` s
 mentions it. The stated justification is not realised anywhere. Tests pin both values, so this is
 a deliberate decision to re-take, not an oversight to patch.
 
-### 7f. Two tests report PASS where they mean SKIP
+### 7f. ~~Two tests report PASS where they mean SKIP~~ DONE 2026-09-10
 
 `tests/Invoke-Tests.ps1:525-530` returns `$true` when its precondition is absent, counting as a
 pass. The same file uses `return 'SKIP'` for the identical situation at `:2216`, and the `It`
@@ -578,7 +578,7 @@ this suite exists to catch, and the suite must not commit it itself."* Same shap
 `tests/Invoke-DeploymentSmoke.ps1:118-119`, where `catch { return $true }` passes "a real write
 into lib\ is refused" on *any* exception, including a missing `lib\`.
 
-### 7g. Two tests assert the fail-open cast the production code was rewritten to avoid
+### 7g. ~~Two tests assert the fail-open cast the production code was rewritten to avoid~~ DONE 2026-09-10
 
 `tests/Invoke-Tests.ps1:162` and `:834` use `[bool](Import-PMModuleInfo ...)['AutoApply']`, which
 is exactly what `Test-PMApplyAllowed` (`PMManifest.ps1:166-175`) was changed to stop doing. If a
@@ -603,7 +603,7 @@ in test fixtures. Either render them in the report (they are good prose and the 
 per-module explanation) or delete them; carrying documentation that nothing displays is the
 worst of both.
 
-### 7j. `$KnownSizes` is inert in `plex-bif-orphans`
+### 7j. ~~`$KnownSizes` is inert in `plex-bif-orphans`~~ DONE 2026-09-10
 
 Declared on `Get-PlexOrphanCandidates` (`:30`), zero body references - it uses `$f.Length`
 directly. The other three modules all use it, and this module's own callers are inconsistent
@@ -614,19 +614,57 @@ because Plex candidates are files rather than trees. Decide which.
 
 Timed under 5.1, the version the scheduled task runs.
 
-| Where | Measured | Fix |
-|---|---|---|
-| `plex-bif-orphans/module.ps1:44-46` | 4,723 ms / **+248.2 MB** on a real 59,820-file tree | one streaming `Stack` + `EnumerateFiles` walk: 2,298 ms / +29.8 MB - **2x time, 8.3x memory**, identical results |
-| `stale-app-temp:18` + `vs-installer-scratch:10` | 565 ms x 4 = **2.26 s** per apply run | both resolve to the SAME Temp directory and each enumerates it in Test *and* Repair; cache the listing on `$Context` (re-deriving between phases is deliberate, the duplication between modules is not) |
-| `PMCommon.ps1:471, 484` | 565 ms vs 88 ms | `DirectoryInfo.EnumerateDirectories()` instead of `Get-ChildItem` - **6.4x**, keeping the `-ErrorVariable` accounting via try/catch |
-| `stale-app-temp/module.ps1:33` | 1,209 ms vs 69 ms over 11,599 names | `foreach` + `break` instead of a `Where-Object` pipeline per directory - **17x**, and this module's own comment calls it "the copy the next module gets cloned from" |
-| `PMModule.ps1:43` | 27-55 ms x 8 phases | re-dot-sources all of `lib\` per phase; scope isolation is the point, low priority |
+| Where | Re-measured 2026-09-10 | Fix | Status |
+|---|---|---|---|
+| `stale-app-temp/module.ps1:33` | **1,511 ms -> 33 ms** over 13,088 real Temp names | `foreach` + `break` with an explicit `[StringComparison]::OrdinalIgnoreCase`, instead of a `Where-Object` pipeline per directory | open - **45x**, the biggest confirmed win and the lowest risk. First recorded as 17x |
+| `PMCommon.ps1:484` and `:497` | **565 ms -> 40 ms**, 27.0 MB -> 4.0 MB, over 13,088 dirs | `DirectoryInfo.EnumerateDirectories()`, returning the raw `DirectoryInfo` objects and `.ToArray()` not the `List` | open - **14x**, not the 6.4x first recorded. Wrapping each entry in a `pscustomobject` throws away 80% of the win; keep it NON-recursive or the one-error-per-location equivalence with `-ErrorVariable` dies |
+| `plex-bif-orphans/module.ps1:44-46` | 10,442 ms -> 9,556 ms; **112.7 MB -> 11.8 MB** on a real 47,802-file tree | one streaming `Stack` + `EnumerateFiles` walk, per-directory `try/catch` feeding `Add-PMReadError -Critical`, skipping reparse points | open - the memory win is real and larger than recorded (**9.6x, ~101 MB**); **the 2x time claim does NOT reproduce** - measured ~8%. The tree is 1.28 files per directory, so 37,192 directory opens dominate and the FileInfo materialisation this removes is a small slice |
+| `PMModule.ps1:43` | 27-55 ms x 8 phases | re-dot-sources all of `lib\` per phase; scope isolation is the point | open, low priority |
+| ~~shared Temp listing between `stale-app-temp` and `vs-installer-scratch`~~ | 3 listings per apply run, not 4 (`stale-app-temp` has `AutoApply = $false`, so its Repair is unreachable); **1.0-1.7 s, not 2.26 s** | - | **CLOSED 2026-09-10, not implemented** - see below |
+
+**Why the shared-listing item was closed rather than done.** Its own recorded remedy was wrong.
+`$ctx` is constructed INSIDE the per-module loop, so caching a listing on it reaches the other
+phase of the SAME module - precisely the Test-to-Repair reuse this project deliberately refuses,
+because the tree changes in between - and cannot reach the other module at all. A cross-module
+cache would have to be a dispatcher-level object, and even then the sharing window is wrong:
+`vs-installer-scratch`'s Repair DELETES Temp directories between the two reads. Worse, the read
+errors would not travel - `Clear-PMReadErrors` runs per phase and the accumulators are
+`$script:`-scoped inside a scope that is then discarded, so a listing produced in one module's
+scope arrives in another's with its failures erased. That is a partial listing that reads as a
+complete one, in the one guarantee this repo calls load-bearing. With `PMCommon.ps1:484` fixed
+each listing costs ~40 ms, so the whole item is worth under 80 ms. Not worth a hole in "blind is
+not clean".
+
+**A trap for whoever does the plex item.** `EnumerateFiles(AllDirectories)` FOLLOWS reparse
+points - `Get-PMTreeStat`'s own comment records that regression - and it aborts the whole
+enumeration on the first unreadable subdirectory instead of recording one error per location the
+way `Get-ChildItem -ErrorVariable` does. Either mistake silently converts "this module went
+blind" into "this module found nothing". Copy the `Stack` + per-directory `try/catch` shape that
+`Get-PMTreeStat` already uses; do not reach for `AllDirectories`.
+
+**Tests that must exist BEFORE those rewrites, because today none of them do.** The plex suite
+has no unreadable-SUBDIRECTORY case and no junction-descent case, so a rewrite using
+`AllDirectories` passes every existing test. `Get-PMChildDirectory` has nothing asserting hidden
+or system directories are still returned, which is the `-Force` semantic an enumerator swap
+silently changes. And `stale-app-temp`'s prefix match is never tested case-insensitively - the
+fixture's `7zO1234` matches `7zO` in exact case and the second prefix `pip-unpack-` has no
+fixture at all, so a rewrite that quietly became ordinal would pass the whole suite. That is the
+degenerate-axis problem this project has already been bitten by once.
 
 **Clean, and worth recording so nobody re-checks:** no undisposed resources in this repo - the
 lock stream is disposed on all three exit paths, the one hand-rolled enumerator has a correct
 try/finally, and there are no `Register-ObjectEvent`, runspaces, jobs or CIM sessions anywhere.
 `+=` appears only over bounded collections. The 200-cap read-error accumulator is correct by
 design. The deployed payload hash-matches the repo exactly.
+
+### 7j-followup. `plex-bif-orphans` still BUILDS a size map nothing reads
+
+Closing 7j removed the only consumer. `Test-PMModule` still returns
+`Sizes = (ConvertTo-PMSizeMap -Items $items)` and the dispatcher still copies it into
+`$ctx.KnownSizes`, so the comment claiming it is handed to Repair "so it does not re-measure" is
+now false for this module alone. Costs one in-memory hashtable per run, not correctness. Left
+deliberately: removing it touches the Test/Repair contract and interacts with the test pinning
+"sizes never appears in the run JSON" - a wider change than the two lines 7j was.
 
 ### 7l. The one that is a note, not a finding
 
