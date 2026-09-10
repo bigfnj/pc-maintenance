@@ -219,6 +219,11 @@ h1 { font-size:22px; font-weight:600; margin:0; letter-spacing:-0.01em; }
 .hero .value { font-size:52px; font-weight:600; line-height:1.05; letter-spacing:-0.02em; margin:0; }
 .hero .note { color:var(--muted); font-size:13px; margin:8px 0 0; }
 .hint { color:var(--muted); font-size:13px; margin:0 0 10px; }
+.notice { display:flex; align-items:flex-start; gap:10px; flex-wrap:wrap;
+          padding:12px 14px; margin:0 0 24px; border-radius:10px;
+          border:1px solid var(--rule); background:var(--surface);
+          color:var(--ink-2); font-size:13px; }
+.notice .badge { flex:none; }
 .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:28px;
          align-items:start; }
 .tile {
@@ -330,6 +335,15 @@ function New-PMHtmlReport {
     [void]$sb.AppendLine('</header>')
     [void]$sb.AppendLine('<p class="sub">Run ' + (ConvertTo-PMHtml $Run.runId) + ' &middot; ' +
         (ConvertTo-PMHtml ([datetime]$Run.startedUtc).ToLocalTime().ToString('dddd d MMMM yyyy, HH:mm')) + '</p>')
+
+    # A run built on a GUESSED profile has to say so on the artifact, not only in the transcript
+    # nobody opens. Status wears an icon and a label as well as a colour, never colour alone.
+    if ($Run.interactiveUser -and $Run.interactiveUser.inferred) {
+        [void]$sb.AppendLine('<p class="notice"><span class="badge"><span class="dot d-warning"></span>' +
+            '<span class="ic">INFERRED USER</span></span><span>Nobody was observed signed in, so the profile ' +
+            'below was taken from the registry and may be the wrong one. Per-user figures describe ' +
+            'whichever profile was picked, and nothing was deleted for it.</span></p>')
+    }
 
     # Hero figure: exactly one per view, the number the report exists to deliver.
     [void]$sb.AppendLine('<div class="hero"><p class="label">' + $heroLabel + '</p>')

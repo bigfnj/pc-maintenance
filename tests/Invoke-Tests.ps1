@@ -1156,6 +1156,251 @@ It 'Downloads resolution never returns empty' {
     return (-not [string]::IsNullOrWhiteSpace($p))
 }
 
+Write-Host "`n== Format-PMBytes, which had no tests at all and two missing tiers ==" -ForegroundColor Cyan
+foreach ($c in @(
+    @{ B = [int64]0;        N = '0 B' }
+    @{ B = [int64]1;        N = '1 B' }
+    @{ B = [int64]512;      N = '512 B' }
+    @{ B = [int64]1KB;      N = '1 KB' }
+    @{ B = [int64]900KB;    N = '900 KB' }
+    @{ B = [int64]1.5MB;    N = '1.5 MB' }
+    @{ B = [int64]2.25GB;   N = '2.25 GB' }
+    @{ B = [int64]2TB;      N = '2.00 TB' })) {
+    $k = $c
+    It "renders $($k.B) bytes as '$($k.N)'" { (Format-PMBytes $k.B) -eq $k.N }
+}
+It 'a real finding under 1 KB no longer reads as nothing found' {
+    # The old tier list bottomed out at KB, so 512 B printed '0 KB' - indistinguishable in the
+    # report from a module that found nothing.
+    ((Format-PMBytes 512) -ne '0 KB') -and ((Format-PMBytes 1) -ne '0 KB')
+}
+It 'a terabyte is not four figures of GB' {
+    (Format-PMBytes ([int64]2TB)) -ne '2,048.00 GB'
+}
+
+Write-Host "`n== log retention (deletes outside the path guard, so it is fenced just as hard) ==" -ForegroundColor Cyan
+function New-PMAgedFile {
+    param([string]$Path, [double]$AgeDays)
+    Set-Content -LiteralPath $Path -Value 'x' -Encoding UTF8
+    (Get-Item -LiteralPath $Path).LastWriteTime = (Get-Date).AddDays(-$AgeDays)
+}
+$logFx = New-PMFixtureRoot 'pm-logs-'
+try {
+    # Ages descend so "newest" is unambiguous; MaxRuns is counted per kind.
+    1..5 | ForEach-Object { New-PMAgedFile (Join-Path $logFx ("run-{0}.json" -f $_)) $_ }
+    1..5 | ForEach-Object { New-PMAgedFile (Join-Path $logFx ("transcript-{0}.log" -f $_)) $_ }
+    New-PMAgedFile (Join-Path $logFx 'latest.json') 400        # old, and must never be a candidate
+    New-PMAgedFile (Join-Path $logFx 'notes.txt')   400        # not ours: the age sweep had no filter
+    # An EMPTY directory named like a run file. Remove-Item -Force deletes an empty directory
+    # happily, so without -File this is genuinely destroyed rather than silently skipped.
+    New-Item -ItemType Directory -Path (Join-Path $logFx 'run-99.json') -Force | Out-Null
+
+    $removed = @(Remove-PMOldLogs -Directory $logFx -MaxRuns 2 -MaxAgeDays 365)
+    $left = @(Get-ChildItem -LiteralPath $logFx -Force | ForEach-Object { $_.Name })
+
+    It 'keeps MaxRuns of EACH kind, not MaxRuns between them' {
+        (@($left | Where-Object { $_ -like 'run-*.json' -and $_ -ne 'run-99.json' }).Count -eq 2) -and
+        (@($left | Where-Object { $_ -like 'transcript-*.log' }).Count -eq 2)
+    }
+    It 'keeps the NEWEST of each kind' {
+        ($left -contains 'run-1.json') -and ($left -contains 'run-2.json') -and
+        (-not ($left -contains 'run-3.json'))
+    }
+    It 'never touches latest.json, however old it is' { $left -contains 'latest.json' }
+    It 'never touches a file this tool did not write' { $left -contains 'notes.txt' }
+    It 'never touches a directory, whatever it is named' { $left -contains 'run-99.json' }
+    It 'reports exactly what it removed' {
+        ($removed.Count -eq 6) -and (@($removed | Where-Object { Test-Path -LiteralPath $_ }).Count -eq 0)
+    }
+} finally { Remove-Item -LiteralPath $logFx -Recurse -Force -ErrorAction SilentlyContinue }
+
+$logFx2 = New-PMFixtureRoot 'pm-logs2-'
+try {
+    New-PMAgedFile (Join-Path $logFx2 'run-old.json') 90
+    New-PMAgedFile (Join-Path $logFx2 'run-new.json') 1
+    It 'the age floor removes an old run even when it is inside MaxRuns' {
+        $null = Remove-PMOldLogs -Directory $logFx2 -MaxRuns 50 -MaxAgeDays 30
+        (-not (Test-Path -LiteralPath (Join-Path $logFx2 'run-old.json'))) -and
+        (Test-Path -LiteralPath (Join-Path $logFx2 'run-new.json'))
+    }
+} finally { Remove-Item -LiteralPath $logFx2 -Recurse -Force -ErrorAction SilentlyContinue }
+
+$logFx3 = New-PMFixtureRoot 'pm-logs3-'
+try {
+    1..3 | ForEach-Object { New-PMAgedFile (Join-Path $logFx3 ("run-{0}.json" -f $_)) $_ }
+    It 'a manifest value of 0 keeps the newest instead of wiping the history' {
+        # MaxRuns floors at 1, the same way Remove-PMOldReports floors Keep. MaxAgeDays 0 is the
+        # more interesting one: flooring THAT at 1 would have read as safety while deleting
+        # everything older than yesterday, so 0 disables the age sweep instead.
+        $null = Remove-PMOldLogs -Directory $logFx3 -MaxRuns 0 -MaxAgeDays 0
+        @(Get-ChildItem -LiteralPath $logFx3 -File).Count -eq 1
+    }
+} finally { Remove-Item -LiteralPath $logFx3 -Recurse -Force -ErrorAction SilentlyContinue }
+
+It 'a missing logs directory is an answer, not an error' {
+    @(Remove-PMOldLogs -Directory (Join-Path ([IO.Path]::GetTempPath()) 'pm-no-such-logs-dir')).Count -eq 0
+}
+
+Write-Host "`n== uninstall's file removal, and both cells of -KeepLogs ==" -ForegroundColor Cyan
+function New-PMPayloadFixture {
+    param([switch]$WithLogs)
+    $fx = New-PMFixtureRoot 'pm-payload-'
+    # Built from a list written out HERE rather than from Get-PMPayloadItems, so the pin below
+    # compares two independent statements of what ships instead of the accessor with itself.
+    Set-Content -LiteralPath (Join-Path $fx 'Invoke-PcMaintenance.ps1') -Value 'x' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Value 'x' -Encoding UTF8
+    New-Item -ItemType Directory -Path (Join-Path $fx 'lib') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $fx 'lib\PMCommon.ps1') -Value 'x' -Encoding UTF8
+    New-Item -ItemType Directory -Path (Join-Path $fx 'modules\m') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $fx 'modules\m\module.ps1') -Value 'x' -Encoding UTF8
+    if ($WithLogs) {
+        New-Item -ItemType Directory -Path (Join-Path $fx 'logs') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $fx 'logs\run-1.json') -Value 'x' -Encoding UTF8
+    }
+    return $fx
+}
+
+$pf = New-PMPayloadFixture -WithLogs
+try {
+    $r = Remove-PMPayloadFiles -Root $pf -KeepLogs
+    It '-KeepLogs removes the payload and leaves the history' {
+        $r.Removed -and $r.KeptLogs -and (-not $r.Blocked) -and
+        (Test-Path -LiteralPath (Join-Path $pf 'logs\run-1.json')) -and
+        (-not (Test-Path -LiteralPath (Join-Path $pf 'lib'))) -and
+        (-not (Test-Path -LiteralPath (Join-Path $pf 'modules'))) -and
+        (-not (Test-Path -LiteralPath (Join-Path $pf 'Invoke-PcMaintenance.ps1'))) -and
+        (-not (Test-Path -LiteralPath (Join-Path $pf 'pcmaintenance.manifest.json')))
+    }
+} finally { Remove-Item -LiteralPath $pf -Recurse -Force -ErrorAction SilentlyContinue }
+
+$pf2 = New-PMPayloadFixture
+try {
+    $r2 = Remove-PMPayloadFiles -Root $pf2 -KeepLogs
+    It '-KeepLogs with no logs directory says so instead of silently deleting everything' {
+        # This used to fall through to the full recursive delete of the root and log the same
+        # line as an uninstall that was never asked to keep anything.
+        $r2.Removed -and (-not $r2.KeptLogs) -and (Test-Path -LiteralPath $pf2) -and
+        ($r2.Detail -like '*no logs directory*')
+    }
+} finally { Remove-Item -LiteralPath $pf2 -Recurse -Force -ErrorAction SilentlyContinue }
+
+$pf3 = New-PMPayloadFixture -WithLogs
+try {
+    $r3 = Remove-PMPayloadFiles -Root $pf3
+    It 'without -KeepLogs the whole root goes, history included' {
+        $r3.Removed -and (-not $r3.KeptLogs) -and (-not (Test-Path -LiteralPath $pf3))
+    }
+} finally { Remove-Item -LiteralPath $pf3 -Recurse -Force -ErrorAction SilentlyContinue }
+
+It 'the uninstaller cannot be pointed at a forbidden directory' {
+    # -PayloadRoot is the only operator-supplied path in the project. This is refused before
+    # anything is enumerated, and it does not exist, so a broken guard still destroys nothing.
+    $a = Remove-PMPayloadFiles -Root 'C:\Users\Someone\Downloads'
+    $a.Blocked -and (-not $a.Removed)
+}
+It 'the uninstaller cannot be pointed one level below the drive' {
+    # This test is why MinDepth stopped counting the drive letter. It used to PASS the guard:
+    # -PayloadRoot C:\ProgramData is two segments, MinDepth was 2, and -RemoveFiles would have
+    # recursively deleted every application's data on the machine. Both names below are chosen
+    # not to exist, so the test is safe even against the version of the code that was wrong.
+    $a = Remove-PMPayloadFiles -Root 'C:\PmNoSuchTopLevelDirectory'
+    $b = Remove-PMPayloadFiles -Root 'D:\PmNoSuchTopLevelDirectory'
+    $a.Blocked -and (-not $a.Removed) -and $b.Blocked -and (-not $b.Removed)
+}
+It 'but its own real payload root is still deep enough' {
+    Test-PMPathSafe -Path 'C:\ProgramData\PcMaintenance' -Roots @('C:\ProgramData') -MinDepth 2
+}
+It 'MinDepth counts directories, not the drive letter' {
+    # Same MinDepth, one directory apart. Before the fix both of these were accepted.
+    (Test-PMPathSafe -Path 'C:\aaa\bbb' -Roots @('C:\aaa') -MinDepth 2) -and
+    (-not (Test-PMPathSafe -Path 'C:\aaa' -Roots @('C:\') -MinDepth 2))
+}
+
+Write-Host "`n== the two hard-coded lists are pinned, by the accessors that existed for it ==" -ForegroundColor Cyan
+# Get-PMForbiddenPathPatterns and Get-PMForbiddenCategories had no call sites anywhere. They are
+# exactly the accessors a test needs to notice a silent edit to either list, so their deadness
+# marked a missing test rather than dead weight to delete. The per-pattern tests above catch a
+# pattern that stops WORKING; these catch one that quietly stops EXISTING, and they compare the
+# joined lists so ORDER is pinned too.
+It 'the forbidden PATH pattern list is exactly what ships' {
+    $expected = @(
+        '^[A-Za-z]:\\?$'
+        '^[A-Za-z]:\\Windows($|\\)'
+        '^[A-Za-z]:\\Program Files( \(x86\))?($|\\)'
+        '^[A-Za-z]:\\Users\\[^\\]+\\(Documents|Desktop|Pictures|Videos|Music|Downloads)($|\\)'
+        '^[A-Za-z]:\\Users\\[^\\]+\\OneDrive[^\\]*($|\\)'
+        '\\AppData\\Roaming\\(\.ssh|\.aws|\.azure|\.kube|\.gnupg|Microsoft\\Crypto|Microsoft\\Protect)($|\\)'
+        '\\\.ssh($|\\)'
+        '\\\.aws($|\\)'
+        '^\\\\'
+        '\\DockerDesktop($|\\)'
+        '\\docker\\volumes($|\\)'
+        '\\wsl\\'
+        '\\\.git($|\\)'
+        '\\site-packages($|\\)'
+        '\\node_modules($|\\)'
+    )
+    $actual = @(Get-PMForbiddenPathPatterns)
+    if (($actual -join "`n") -ne ($expected -join "`n")) {
+        Write-Host "    have $($actual.Count), pinned $($expected.Count)" -ForegroundColor DarkYellow
+        foreach ($d in (Compare-Object $actual $expected)) {
+            Write-Host ("    {0} {1}" -f $d.SideIndicator, $d.InputObject) -ForegroundColor DarkYellow
+        }
+        return $false
+    }
+    return $true
+}
+It 'the forbidden CATEGORY list is exactly what ships' {
+    $expected = @(
+        'security', 'defender', 'antivirus', 'av', 'wdac', 'device-guard', 'hvci',
+        'applocker', 'bitlocker', 'firewall', 'credential-guard', 'smartscreen-enforcement'
+    )
+    $actual = @(Get-PMForbiddenCategories)
+    ($actual -join '|') -eq ($expected -join '|')
+}
+It 'the deployed payload list is exactly what ships' {
+    # Shared by the installer's copy loop and the uninstaller's -KeepLogs removal. Adding a fifth
+    # item to one and not the other would strand it on every keep-logs uninstall, which is why
+    # there is now one list and this pin over it.
+    (@(Get-PMPayloadItems) -join '|') -eq 'Invoke-PcMaintenance.ps1|pcmaintenance.manifest.json|lib|modules'
+}
+
+Write-Host "`n== a guessed profile has to say it was guessed ==" -ForegroundColor Cyan
+It 'a user resolved only from the registry is marked Inferred' {
+    # Somebody IS signed in on the machine running this, so asserting the live value would only
+    # ever exercise the confirmed branch. PowerShell resolves commands through the CALLER's scope
+    # chain and puts functions ahead of cmdlets, so shadowing Get-CimInstance here forces
+    # Get-PMInteractiveUserSid past both of its observation sources and down to the ProfileList
+    # fallback - the only path that can produce Inferred.
+    function Get-CimInstance { throw 'no CIM inside this test' }
+    $u = Get-PMInteractiveUserSid
+    if (-not $u.Sid) { return 'SKIP' }   # no local profiles at all; there is nothing to assert
+    $u.Inferred -and (-not $u.LoggedIn) -and ($null -ne $u.Profile)
+}
+It 'and a user who was actually observed is not' {
+    $u = Get-PMInteractiveUserSid
+    if (-not $u.LoggedIn) { return 'SKIP' }   # nobody signed in; the confirmed branch is unreachable
+    (-not $u.Inferred) -and ($null -ne $u.Sid)
+}
+foreach ($cell in @(@{ I = $true; Want = $true }, @{ I = $false; Want = $false })) {
+    $c = $cell
+    It "the report $(if ($c.Want) { 'warns' } else { 'stays quiet' }) when inferred=$($c.I)" {
+        $run = [ordered]@{
+            runId='r'; startedUtc=(Get-Date).ToUniversalTime().ToString('o')
+            finishedUtc=(Get-Date).ToUniversalTime().ToString('o'); version='t'; mode='report'
+            interactiveUser=[ordered]@{ sid='S-1-5-21-1'; profile='C:\Users\X'; loggedIn=(-not $c.I); inferred=$c.I }
+            modules=@([ordered]@{ id='m'; status='clean'; detail='d'; bytes=[int64]0; count=0; items=@() })
+            summary=[ordered]@{ total=1;clean=1;found=0;applied=0;skipped=0;unverified=0;partial=0;errors=0;bytes=[int64]0 }
+            exitCode=0
+        }
+        $o = Join-Path ([IO.Path]::GetTempPath()) ("pm-inf-" + [guid]::NewGuid().ToString('N').Substring(0,8) + ".html")
+        try {
+            $null = New-PMHtmlReport -Run $run -OutPath $o
+            return (((Get-Content $o -Raw) -match 'INFERRED USER') -eq $c.Want)
+        } finally { Remove-Item -LiteralPath $o -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }
 Write-Host ("`n{0} passed, {1} failed{2}`n" -f $script:Pass, $script:Fail, $tail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

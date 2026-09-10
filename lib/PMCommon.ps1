@@ -38,8 +38,21 @@ function Resolve-PMSidToProfile {
 
 function Get-PMInteractiveUserSid {
     # Resolve the interactive (console) user; works when the dispatcher runs as SYSTEM, which is
-    # how it reaches C:\Users\<user>\AppData\Local\Temp. Returns Sid/Profile/LoggedIn; Sid may be
-    # $null at the logon screen, in which case every per-user module is skipped rather than guessed.
+    # how it reaches C:\Users\<user>\AppData\Local\Temp. Returns Sid/Profile/LoggedIn/Inferred.
+    #
+    # Three sources, in descending confidence. The first two OBSERVE a session that is really
+    # there and set LoggedIn. The third GUESSES: it takes the first plausible profile out of the
+    # registry in whatever order the keys happen to enumerate, which on a multi-profile machine
+    # with nobody signed in can be a stranger. That fallback is kept deliberately, because
+    # reporting the wrong profile's numbers is visible and harmless, and it is MARKED
+    # deliberately - Inferred is $true, LoggedIn is $false, and Test-PMActingUserConfirmed
+    # refuses to let anything DELETE for a user resolved this way.
+    #
+    # (This comment used to claim no user is ever guessed. It was wrong for as long as the third
+    # fallback has existed. The deletion gate was right; the description of it was not.)
+    #
+    # Sid may still be $null at the logon screen with no profiles at all, in which case every
+    # per-user module is skipped rather than guessed.
     $sid = $null; $loggedIn = $false; $account = $null
     try { $account = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
     if ($account) {
@@ -68,7 +81,10 @@ function Get-PMInteractiveUserSid {
         if ($cand) { $sid = $cand.Sid }
     }
     $prof = if ($sid) { Resolve-PMSidToProfile -Sid $sid } else { $null }
-    [pscustomobject]@{ Sid = $sid; Profile = $prof; LoggedIn = $loggedIn }
+    # Inferred means: there is a SID, but nothing observed a session for it. Only the
+    # registry fallback can produce that combination.
+    [pscustomobject]@{ Sid = $sid; Profile = $prof; LoggedIn = $loggedIn
+                       Inferred = [bool]($sid -and -not $loggedIn) }
 }
 
 # --- the path guard -------------------------------------------------------------------
@@ -123,7 +139,15 @@ function Test-PMPathSafe {
     <#
         Two independent conditions, both required:
           1. the target sits UNDER one of the roots the module declared, and
-          2. it matches no forbidden pattern, and is at least MinDepth segments deep.
+          2. it matches no forbidden pattern, and is at least MinDepth DIRECTORIES deep.
+
+        MinDepth counts directory segments with the DRIVE EXCLUDED, because 'C:' is not a
+        directory and counting it made the parameter read one level deeper than it was. That
+        was not academic: Uninstall-PcMaintenance.ps1 asked for MinDepth 2 meaning "below a
+        top-level directory" and got "drive plus one directory", so -PayloadRoot C:\ProgramData
+        passed the guard and a -RemoveFiles run would have taken all of ProgramData with it.
+        The default moved 3 -> 2 at the same time, which leaves every module caller counting
+        exactly the same segments as before; only the uninstaller gets stricter.
 
         (1) alone is not enough: a module with a broad root would still be able to reach a
         Docker volume inside it. (2) alone is not enough either: it would let a module delete
@@ -132,12 +156,14 @@ function Test-PMPathSafe {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Path,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Roots,
-        [int]$MinDepth = 3
+        [int]$MinDepth = 2
     )
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     $full = try { [IO.Path]::GetFullPath($Path) } catch { return $false }
     $full = $full.TrimEnd('\')
-    if (($full -split '\\').Where({ $_ }).Count -lt $MinDepth) { return $false }
+    $segments = @(($full -split '\\').Where({ $_ }))
+    if ($segments.Count -and $segments[0] -match '^[A-Za-z]:$') { $segments = @($segments | Select-Object -Skip 1) }
+    if ($segments.Count -lt $MinDepth) { return $false }
     foreach ($pat in $script:PMForbiddenPathPatterns) { if ($full -match $pat) { return $false } }
     foreach ($r in $Roots) {
         if ([string]::IsNullOrWhiteSpace($r)) { continue }
@@ -478,7 +504,7 @@ function Remove-PMPath {
         [AllowEmptyCollection()][string[]]$DeclaredRoots = @(),
         [int64]$KnownBytes = -1,
         [switch]$WhatIfOnly,
-        [int]$MinDepth = 3
+        [int]$MinDepth = 2   # DIRECTORIES below the drive; see Test-PMPathSafe
     )
     if (-not (Test-PMPathSafe -Path $Path -Roots $Roots -MinDepth $MinDepth)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'refused by path guard'; Bytes = [int64]0 }
@@ -516,9 +542,139 @@ function Remove-PMPath {
 }
 
 function Format-PMBytes {
+    # This string IS the report, so both missing tiers were readability bugs rather than rounding
+    # ones. Without a bytes tier anything under 512 B printed '0 KB', which reads as "nothing
+    # found" for a real finding; without a TB tier a 2 TB sweep printed '2,048.00 GB'.
     param([Parameter(Mandatory)][AllowNull()][int64]$Bytes)
     if (-not $Bytes) { return '0 B' }
+    if ($Bytes -ge 1TB) { return ('{0:N2} TB' -f ($Bytes / 1TB)) }
     if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
     if ($Bytes -ge 1MB) { return ('{0:N1} MB' -f ($Bytes / 1MB)) }
-    return ('{0:N0} KB' -f ($Bytes / 1KB))
+    if ($Bytes -ge 1KB) { return ('{0:N0} KB' -f ($Bytes / 1KB)) }
+    return ('{0:N0} B' -f $Bytes)
+}
+
+
+# --- the deletions that deliberately do NOT go through the path guard ------------------
+#
+# There are exactly two, and both delete inside directories the guard forbids outright: logs\
+# sits under the payload root, and reports land in Downloads. Widening the guard so they could
+# pass would trade a narrow convenience for the broadest hole in the tool, so each is instead its
+# own much stricter rule that can only ever match files THIS tool wrote. Remove-PMOldReports is
+# the other one; it lives in PMReport.ps1, next to the writer whose output it prunes.
+
+function Remove-PMOldLogs {
+    <#
+        Retention for the run history under logs\.
+
+          - a FILE, never a directory. Without -File a directory under logs\ matched, and
+            Remove-Item -Force without -Recurse then failed silently under -EA SilentlyContinue:
+            a no-op that read, in the transcript, exactly like retention working.
+          - the name must be one this tool writes. The age sweep previously had no filter at all,
+            so anything older than the cut went with it, including a file another tool left here.
+          - -like, not -Filter. -Filter is a Win32 pattern and matches more than it appears to;
+            this is the same trap plex-bif-orphans' EndsWith fix exists for.
+          - never a reparse point.
+          - latest.json survives because it matches neither name, not by a special case.
+
+        Returns the paths removed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [int]$MaxRuns = 50,
+        [int]$MaxAgeDays = 30
+    )
+    if ($MaxRuns -lt 1) { $MaxRuns = 1 }   # a bad manifest value must not wipe the history
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return @() }
+
+    $ours = @(Get-ChildItem -LiteralPath $Directory -File -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'run-*.json' -or $_.Name -like 'transcript-*.log' } |
+        Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) })
+    if (-not $ours.Count) { return @() }
+
+    $doomed = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($pattern in @('run-*.json', 'transcript-*.log')) {
+        # Counted PER KIND, so MaxRuns 50 keeps 50 of each rather than 50 files between them.
+        foreach ($f in @($ours | Where-Object { $_.Name -like $pattern } |
+                         Sort-Object LastWriteTime -Descending | Select-Object -Skip $MaxRuns)) {
+            $null = $doomed.Add($f.FullName)
+        }
+    }
+    # A non-positive age means NO age sweep. Flooring it at 1 instead would read as safety and
+    # behave as "delete everything older than yesterday", which is the opposite.
+    if ($MaxAgeDays -ge 1) {
+        $cut = (Get-Date).AddDays(-$MaxAgeDays)
+        foreach ($f in @($ours | Where-Object { $_.LastWriteTime -lt $cut })) { $null = $doomed.Add($f.FullName) }
+    }
+
+    $removed = @()
+    foreach ($path in $doomed) {
+        try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop; $removed += $path } catch { }
+    }
+    return $removed
+}
+
+# The deployed payload, named in ONE place. The installer copies these and the uninstaller's
+# -KeepLogs removes exactly these, so a fifth item added to one list and not the other would
+# strand a stale file on every keep-logs uninstall.
+$script:PMPayloadItems = @('Invoke-PcMaintenance.ps1', 'pcmaintenance.manifest.json', 'lib', 'modules')
+
+function Get-PMPayloadItems { $script:PMPayloadItems }
+
+function Remove-PMPayloadFiles {
+    <#
+        The uninstaller's file removal, here rather than inline in the script so it can be tested
+        against a fixture without elevating and without touching the real scheduled task.
+
+        -Root is operator input and this is a recursive force delete, so it goes through the same
+        guard every module does. Without it, -PayloadRoot C:\ deleted the drive root.
+
+        -KeepLogs removes the deployed items and leaves logs\ alone. It used to fall through to
+        the full delete whenever logs\ did not exist, so asking to keep a history you did not
+        have deleted the root and logged the same line as never asking. The two cases are
+        separate now, and both say which one happened.
+
+        MinDepth 2 here means two directories below the drive, so the shallowest root this will
+        accept is C:\Something\PcMaintenance. C:\ProgramData on its own is refused.
+
+        Returns Blocked / Removed / KeptLogs / Detail.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [switch]$KeepLogs
+    )
+    $r = [pscustomobject]@{ Blocked = $false; Removed = $false; KeptLogs = $false; Detail = '' }
+
+    $guardRoot = Split-Path -Parent $Root
+    if (-not (Test-PMPathSafe -Path $Root -Roots @($guardRoot) -MinDepth 2)) {
+        $r.Blocked = $true
+        $r.Detail  = "refusing to delete '$Root' - the path guard rejects it"
+        return $r
+    }
+    if (-not (Test-Path -LiteralPath $Root)) {
+        $r.Detail = "nothing to remove at $Root"
+        return $r
+    }
+
+    if ($KeepLogs) {
+        $logsDir = Join-Path $Root 'logs'
+        $hadLogs = Test-Path -LiteralPath $logsDir
+        foreach ($i in (Get-PMPayloadItems)) {
+            $item = Join-Path $Root $i
+            if (Test-Path -LiteralPath $item) {
+                Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $r.Removed  = $true
+        $r.KeptLogs = $hadLogs
+        $r.Detail   = if ($hadLogs) { "removed the payload, kept $logsDir" }
+                      else { 'removed the payload; there was no logs directory to keep' }
+        return $r
+    }
+
+    Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+    $r.Removed = -not (Test-Path -LiteralPath $Root)
+    $r.Detail  = if ($r.Removed) { "removed $Root (run history included)" }
+                 else { "could not fully remove $Root" }
+    return $r
 }

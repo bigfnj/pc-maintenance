@@ -9,8 +9,22 @@
     -RestoreBackups here (the project this borrows from has one) for the reason the whole design turns on:
     nothing backs up a deletion. The run JSON is the record.
 
+.PARAMETER PayloadRoot
+    Where the payload was installed. This is operator input feeding a recursive force delete, so
+    it goes through the same path guard every module does.
+
+.PARAMETER RemoveFiles
+    Also delete the payload. Without it only the scheduled task goes.
+
+.PARAMETER KeepLogs
+    With -RemoveFiles, remove the deployed files but leave logs\ and its run history in place.
+    Has no effect on its own, and now says so rather than being a silent no-op.
+
 .EXAMPLE
     .\Uninstall-PcMaintenance.ps1 -RemoveFiles
+
+.EXAMPLE
+    .\Uninstall-PcMaintenance.ps1 -RemoveFiles -KeepLogs
 #>
 [CmdletBinding()]
 param(
@@ -43,24 +57,18 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 }
 
 if ($RemoveFiles) {
-    # -PayloadRoot is operator input and this is a recursive force delete, so it goes through the
-    # same guard every module does. Without it, -PayloadRoot C:\ deleted the drive root.
-    $guardRoot = Split-Path -Parent $PayloadRoot
-    if (-not (Test-PMPathSafe -Path $PayloadRoot -Roots @($guardRoot) -MinDepth 2)) {
-        Write-PMLog "refusing to delete '$PayloadRoot' - the path guard rejects it" 'ERROR'
-        exit 1
-    }
-    if ($KeepLogs -and (Test-Path -LiteralPath (Join-Path $PayloadRoot 'logs'))) {
-        foreach ($i in @('Invoke-PcMaintenance.ps1', 'pcmaintenance.manifest.json', 'lib', 'modules')) {
-            $p = Join-Path $PayloadRoot $i
-            if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
-        }
-        Write-PMLog "removed the payload, kept $PayloadRoot\logs" 'CHANGE'
-    } elseif (Test-Path -LiteralPath $PayloadRoot) {
-        Remove-Item -LiteralPath $PayloadRoot -Recurse -Force
-        Write-PMLog "removed $PayloadRoot (run history included)" 'CHANGE'
-    }
+    # The guard, the -KeepLogs split and the delete itself all live in Remove-PMPayloadFiles, so
+    # they can be tested against a fixture without elevating and without unregistering the real
+    # task. This script keeps the parts that genuinely need to be here: elevation and exit codes.
+    $outcome = Remove-PMPayloadFiles -Root $PayloadRoot -KeepLogs:$KeepLogs
+    if ($outcome.Blocked) { Write-PMLog $outcome.Detail 'ERROR'; exit 1 }
+    Write-PMLog $outcome.Detail $(if ($outcome.Removed) { 'CHANGE' } else { 'SKIP' })
 } else {
+    # -KeepLogs alone used to do nothing and say nothing. Nothing is being deleted, so there is
+    # nothing to keep; a switch that silently does not apply is worse than one that objects.
+    if ($KeepLogs) {
+        Write-PMLog '-KeepLogs does nothing without -RemoveFiles: no files are being deleted' 'WARN'
+    }
     Write-PMLog "payload left at $PayloadRoot (pass -RemoveFiles to delete it)" 'INFO'
 }
 

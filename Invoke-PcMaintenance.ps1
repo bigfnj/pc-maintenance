@@ -110,7 +110,13 @@ try {
 
     $user = Get-PMInteractiveUserSid
     $sidLabel = if ($user.Sid) { $user.Sid } else { '<none>' }
-    Write-PMLog ("interactive user: {0} (loggedIn={1})" -f $sidLabel, $user.LoggedIn)
+    Write-PMLog ("interactive user: {0} (loggedIn={1}, inferred={2})" -f $sidLabel, $user.LoggedIn, $user.Inferred)
+    if ($user.Inferred) {
+        # Every per-user number in this run describes whichever profile the registry happened to
+        # yield first. Deletion is already blocked for it; the READING has to say so too, or the
+        # report looks identical to one built on a confirmed session.
+        Write-PMLog 'that profile was INFERRED from the registry, not observed - per-user figures may describe the wrong user' 'WARN'
+    }
 
     foreach ($mod in $enabled) {
         $modId  = [string]$mod.id
@@ -259,6 +265,15 @@ try {
     $runObj = [ordered]@{
         runId = $runId; startedUtc = $startedUtc; finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
         version = $DispatcherVersion; mode = $(if ($Apply) { 'apply' } else { 'report' })
+        # The run record has to carry HOW the user was resolved, not just which one. A report
+        # built on a guessed profile is not wrong so much as unattributed, and it is
+        # indistinguishable from a confirmed one without this.
+        interactiveUser = [ordered]@{
+            sid      = $(if ($user) { $user.Sid } else { $null })
+            profile  = $(if ($user) { $user.Profile } else { $null })
+            loggedIn = [bool]($user -and $user.LoggedIn)
+            inferred = [bool]($user -and $user.Inferred)
+        }
         modules = $results; summary = $summary; exitCode = $exitCode
         fatal = if ($fatal) { [string]$fatal.Exception.Message } else { $null }
     }
@@ -303,13 +318,10 @@ try {
             if ($manifest.logRetention.maxRuns)    { $maxRuns = [int]$manifest.logRetention.maxRuns }
             if ($manifest.logRetention.maxAgeDays) { $maxAge  = [int]$manifest.logRetention.maxAgeDays }
         }
-        $cut = (Get-Date).AddDays(-$maxAge)
-        Get-ChildItem $logsDir -Filter 'run-*.json' -EA SilentlyContinue | Sort-Object LastWriteTime -Descending |
-            Select-Object -Skip $maxRuns | Remove-Item -Force -EA SilentlyContinue
-        Get-ChildItem $logsDir -Filter 'transcript-*.log' -EA SilentlyContinue | Sort-Object LastWriteTime -Descending |
-            Select-Object -Skip $maxRuns | Remove-Item -Force -EA SilentlyContinue
-        Get-ChildItem $logsDir -EA SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut -and $_.Name -ne 'latest.json' } |
-            Remove-Item -Force -EA SilentlyContinue
+        # Was three inline pipelines, none of them -File and the last with no name filter at all,
+        # so a directory under logs\ matched and Remove-Item -Force without -Recurse then failed
+        # silently. Now one fenced function with tests behind it; see Remove-PMOldLogs.
+        $null = Remove-PMOldLogs -Directory $logsDir -MaxRuns $maxRuns -MaxAgeDays $maxAge
     } catch {}
 
     # Dispose alone is enough, and it is wrapped: a throw here would skip Stop-Transcript below.
