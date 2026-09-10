@@ -33,6 +33,14 @@ function New-PMFixtureRoot {
     return $fx
 }
 $script:Pass = 0; $script:Fail = 0; $script:Skip = 0
+# When this run began. The teardown at the bottom only sweeps fixtures created after this
+# instant, which keeps it off anything left by an earlier run or another tool.
+#
+# It does NOT make two suites running at the same time safe - the later one would sweep the
+# earlier one's live fixtures mid-test. Running two copies concurrently is not a thing anyone
+# does, and the alternative (registering every fixture at ~20 creation sites) costs more than
+# it buys. Noted so the next person hitting a bizarre concurrent failure knows where to look.
+$script:SuiteStartUtc = (Get-Date).ToUniversalTime()
 function It {
     <#
         A body returns $true, $false, or the string 'SKIP' when a precondition this machine cannot
@@ -1845,6 +1853,104 @@ function Repair-PMModule {
         return ($j.mode -eq 'apply' -and $j.modules[0].status -eq 'applied' -and
                 [int64]$j.summary.bytes -eq 2000 -and $gone)
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== capping retained read errors must not cap the COUNT ==" -ForegroundColor Cyan
+# The accumulator keeps at most 200 ErrorRecords now, because it used to keep every one in an
+# array grown with += - O(n^2), and 1-3 KB of Exception/InvocationInfo apiece. The danger in
+# that fix is obvious and worth pinning: if the reported count came from the capped list, a
+# module that failed 50,000 reads would report 200, and capping memory would have quietly
+# become under-reporting blindness.
+function New-PMFakeError {
+    param([string]$Message = 'simulated read failure')
+    try { throw $Message } catch { return $_ }
+}
+
+It 'the count is every error seen, not the number retained' {
+    Clear-PMReadErrors
+    $e = New-PMFakeError
+    foreach ($i in 1..500) { Add-PMReadError -Errors $e }
+    (Get-PMReadErrorCount) -eq 500
+}
+It 'while retention stays bounded' {
+    Clear-PMReadErrors
+    $e = New-PMFakeError
+    foreach ($i in 1..500) { Add-PMReadError -Errors $e }
+    # PMCommon is DOT-SOURCED by this suite, so its $script: scope IS this script's scope and
+    # the retained list is directly visible. That is the only way to observe the cap - it is an
+    # implementation detail with no accessor, and a test that cannot see it asserts nothing.
+    ($script:PMReadErrors.Count -le 200) -and ($script:PMReadErrors.Count -gt 0)
+}
+It 'critical errors count separately and are also capped' {
+    Clear-PMReadErrors
+    $e = New-PMFakeError
+    foreach ($i in 1..300) { Add-PMReadError -Errors $e -Critical }
+    ((Get-PMCriticalReadErrorCount) -eq 300) -and ((Get-PMReadErrorCount) -eq 300)
+}
+It 'a non-critical error does not inflate the critical count' {
+    Clear-PMReadErrors
+    Add-PMReadError -Errors (New-PMFakeError)
+    Add-PMReadError -Errors (New-PMFakeError) -Critical
+    ((Get-PMReadErrorCount) -eq 2) -and ((Get-PMCriticalReadErrorCount) -eq 1)
+}
+It 'Clear resets both the lists and both counters' {
+    Add-PMReadError -Errors (New-PMFakeError) -Critical
+    Clear-PMReadErrors
+    ((Get-PMReadErrorCount) -eq 0) -and ((Get-PMCriticalReadErrorCount) -eq 0) -and ((Get-PMReadErrorSample) -eq '')
+}
+It 'a sample and messages still come back after the cap is exceeded' {
+    # Bounding retention must not cost the human-readable half: the sample and the deduplicated
+    # message list are what turn "Unreadable: 500" into something actionable.
+    Clear-PMReadErrors
+    foreach ($i in 1..400) { Add-PMReadError -Errors (New-PMFakeError -Message "cannot read thing $i") }
+    $msgs = @(Get-PMReadErrorMessages -Max 10)
+    ((Get-PMReadErrorSample) -match 'cannot read thing') -and ($msgs.Count -gt 0) -and ($msgs.Count -le 10)
+}
+It 'and 5,000 errors are recorded without quadratic blow-up' {
+    # A wall-clock budget is the only cheap way to catch a regression to +=, but it is also the
+    # only thing in this suite that can fail because the machine was busy - and it did once,
+    # unreproducibly, at a 10s budget. Widened to 60s rather than deleted: the point is to catch
+    # O(n^2), where the old array-append shape took minutes at this size, not to measure the
+    # machine. Anything under a minute here is a pass, and a real regression is nowhere near.
+    Clear-PMReadErrors
+    $e = New-PMFakeError
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    foreach ($i in 1..5000) { Add-PMReadError -Errors $e }
+    $sw.Stop()
+    ((Get-PMReadErrorCount) -eq 5000) -and ($sw.Elapsed.TotalSeconds -lt 60)
+}
+
+# -- fixture teardown ------------------------------------------------------------------------
+# Every fixture helper here creates a pm-* directory under TEMP and every caller cleans up in a
+# finally. This is the backstop for when that does not happen, and it REPORTS rather than
+# sweeping silently - a quiet sweep would hide exactly the leak it exists to catch.
+#
+# Not hypothetical. Seven pm-vs-* trees were found stranded from a single run on 2026-09-09:
+# vs-installer-scratch was leaking a find handle on the payload-cache directory, an open handle
+# blocks Remove-Item, and -ErrorAction SilentlyContinue swallowed the failure. The handle leak
+# is fixed; this catches the next one, whatever causes it.
+#
+# Worth the effort because of WHAT strands: New-PMFixtureRoot hardens the ACL when elevated
+# (SYSTEM + Administrators full, Users read-only), so a stranded one is not deletable by the
+# user afterwards, and its name matches nothing in stale-app-temp's allowlist, so this tool
+# will never clean it up either.
+$leaked = @()
+try {
+    $tempRoot = [IO.Path]::GetTempPath()
+    foreach ($f in @(Get-ChildItem -LiteralPath $tempRoot -Filter 'pm-*' -Force -ErrorAction SilentlyContinue)) {
+        if ($f.CreationTimeUtc -lt $script:SuiteStartUtc) { continue }   # not from this run
+        # An ACL-hardened fixture needs icacls /reset, not Set-Acl: Set-Acl wants
+        # SeSecurityPrivilege and strands an undeletable directory behind it.
+        if ($f.PSIsContainer) { $null = icacls $f.FullName /reset /T /C 2>&1 }
+        Remove-Item -LiteralPath $f.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $f.FullName) { $leaked += "$($f.Name) (could not remove)" }
+        else { $leaked += $f.Name }
+    }
+} catch { }
+if ($leaked.Count) {
+    Write-Host ("`n{0} fixture(s) survived their own cleanup and were swept here:" -f $leaked.Count) -ForegroundColor Yellow
+    $leaked | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+    Write-Host "  a fixture reaching this sweep means some test's finally did not run - worth finding out why" -ForegroundColor Yellow
 }
 
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }

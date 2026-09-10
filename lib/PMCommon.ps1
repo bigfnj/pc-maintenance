@@ -317,16 +317,46 @@ function Set-PMPayloadAcl {
 # The counter lives in the module's own child scope, so Invoke-PMModulePhase reads it back
 # out and the dispatcher decides what to do. Modules do not have to remember anything.
 
-$script:PMReadErrors = @()          # anything unreadable: partial coverage
-$script:PMCriticalReadErrors = @()  # a read the module said its ANSWER depends on
+# Retained SAMPLES, not every error. The COUNTS are separate integers, so capping what is kept
+# does not change a single number the dispatcher reports.
+#
+# It used to keep every ErrorRecord in a plain array grown with +=, which is two problems at
+# once. += reallocates the whole array per append, so a tree where every read fails is O(n^2) -
+# at the documented 13,341 directories that is ~89 million element copies, the same shape
+# measured at 6,733 ms elsewhere in this project. And each ErrorRecord drags an Exception, a
+# TargetObject and an InvocationInfo (script text and position) behind it, roughly 1-3 KB, so
+# 100k of them is 100-300 MB held inside a SYSTEM process.
+#
+# Nothing ever consumed the retained records. Everything downstream reads a count, one sample
+# message, or at most ten deduplicated messages - so beyond the cap they were pure weight.
+$script:PMReadErrors = New-Object 'System.Collections.Generic.List[object]'
+$script:PMCriticalReadErrors = New-Object 'System.Collections.Generic.List[object]'
+$script:PMReadErrorCount = 0            # every error seen, whether or not it was kept
+$script:PMCriticalReadErrorCount = 0
+$script:PMReadErrorSampleCap = 200      # far more than the 10 anything actually displays
 
-function Clear-PMReadErrors { $script:PMReadErrors = @(); $script:PMCriticalReadErrors = @() }
-function Get-PMReadErrorCount { @($script:PMReadErrors).Count }
-function Get-PMCriticalReadErrorCount { @($script:PMCriticalReadErrors).Count }
+function Clear-PMReadErrors {
+    $script:PMReadErrors = New-Object 'System.Collections.Generic.List[object]'
+    $script:PMCriticalReadErrors = New-Object 'System.Collections.Generic.List[object]'
+    $script:PMReadErrorCount = 0
+    $script:PMCriticalReadErrorCount = 0
+}
+# The counter, NOT the list length. That distinction is the whole point of the cap: a module
+# that failed 50,000 reads must still report 50,000, or capping memory would quietly become
+# under-reporting blindness - which is the one thing this file exists to prevent.
+function Get-PMReadErrorCount { $script:PMReadErrorCount }
+function Get-PMCriticalReadErrorCount { $script:PMCriticalReadErrorCount }
+# Critical first, then incidental, and NEITHER wrapped in @().
+#
+# `@($emptyGenericList)` throws "Argument types do not match" - measured, not theorised. That is
+# harmless while these are plain arrays and fatal the moment they become List[object], which
+# capping the accumulator required. It broke eight tests at once, every one of them a caller
+# that merely wanted to read an error message. Indexing the lists directly avoids the construct
+# entirely and reads better anyway.
 function Get-PMReadErrorSample {
-    $e = @($script:PMCriticalReadErrors) + @($script:PMReadErrors)
-    if (-not $e.Count) { return '' }
-    return [string]$e[0].Exception.Message
+    if ($script:PMCriticalReadErrors.Count -gt 0) { return [string]$script:PMCriticalReadErrors[0].Exception.Message }
+    if ($script:PMReadErrors.Count -gt 0) { return [string]$script:PMReadErrors[0].Exception.Message }
+    return ''
 }
 
 # -Critical marks a read whose FAILURE INVALIDATES THE ANSWER: the module's own root, the one
@@ -343,9 +373,15 @@ function Get-PMReadErrorMessages {
     # nothing they could act on: "Unreadable: 1" is not a fact anyone can do anything with.
     param([int]$Max = 10)
     $seen = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($e in @($script:PMCriticalReadErrors) + @($script:PMReadErrors)) {
-        $m = [string]$e.Exception.Message
-        if ($m -and -not $seen.Contains($m)) { $seen.Add($m) }
+    # Two explicit passes rather than one over a concatenation: see Get-PMReadErrorSample for
+    # why @() must not touch these lists. Critical first, so the ten shown favour the failures
+    # that invalidated an answer over the ones that merely narrowed coverage.
+    foreach ($src in @($script:PMCriticalReadErrors, $script:PMReadErrors)) {
+        foreach ($e in $src) {
+            if ($seen.Count -ge $Max) { break }
+            $m = [string]$e.Exception.Message
+            if ($m -and -not $seen.Contains($m)) { $seen.Add($m) }
+        }
         if ($seen.Count -ge $Max) { break }
     }
     return $seen.ToArray()
@@ -354,8 +390,16 @@ function Get-PMReadErrorMessages {
 function Add-PMReadError {
     param($Errors, [switch]$Critical)
     if (-not $Errors) { return }
-    $script:PMReadErrors += @($Errors)
-    if ($Critical) { $script:PMCriticalReadErrors += @($Errors) }
+    # Count everything, keep the first $PMReadErrorSampleCap. List.Add is amortised O(1); the
+    # += this replaced reallocated the whole array on every single append.
+    foreach ($e in @($Errors)) {
+        $script:PMReadErrorCount++
+        if ($script:PMReadErrors.Count -lt $script:PMReadErrorSampleCap) { $script:PMReadErrors.Add($e) }
+        if ($Critical) {
+            $script:PMCriticalReadErrorCount++
+            if ($script:PMCriticalReadErrors.Count -lt $script:PMReadErrorSampleCap) { $script:PMCriticalReadErrors.Add($e) }
+        }
+    }
 }
 
 # The existence guard on both readers uses the native call, not Test-Path. It is the same
