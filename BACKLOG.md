@@ -212,7 +212,7 @@ decisions last - but round 2 added one: **a closed item is not evidence.** Item 
 closed WON'T FIX on reasoning that turned out to be false, and it read as settled for exactly as
 long as nobody re-derived it.
 
-### 6a. The re-enumeration between Test and Repair costs a second full sizing pass
+### 6a. ~~The re-enumeration between Test and Repair costs a second full sizing pass~~ DONE
 
 **Measured, HIGH on cost, zero on safety.** Repair re-derives candidates, and the candidates
 function measures `Bytes` inline, so every path is sized twice on an apply run. The comments
@@ -226,7 +226,7 @@ model assumes that window exists. Only the *sizing* is waste. The fix is an in-m
 map on `$ctx` for the Repair phase, never serialized, with Repair measuring only paths it newly
 selected.
 
-### 6b. The vs payload-cache probe is the single largest measured cost, and finds nothing
+### 6b. ~~The vs payload-cache probe is the single largest measured cost, and finds nothing~~ DONE
 
 **Measured 13,237 ms, twice per apply run, zero hits.** It calls `Get-PMChildDirectory` on every
 non-8.3-named TEMP directory older than 24h - 6,402 of them on this box - and reached the `.vsix`
@@ -234,14 +234,14 @@ stage zero times. The payload cache is *one* directory with a stable random name
 resolved path and re-probe only that, falling back to the full sweep when the cached path stops
 qualifying.
 
-### 6c. Cheaper existence checks in the two shared readers
+### 6c. ~~Cheaper existence checks in the two shared readers~~ DONE
 
 `Test-Path -LiteralPath` measured **3,398 ms** over 6,402 paths against **280 ms** for
 `[IO.Directory]::Exists` - 12x, and it scales with every future per-item module. The guard itself
 must stay: it is what separates "path absent, return empty quietly" from "path present but
 unlistable, record a read error". The native call preserves that distinction exactly.
 
-### 6d. Two walks per candidate that could be one
+### 6d. ~~Two walks per candidate that could be one~~ DONE
 
 `Get-PMNewestWriteUtc` and `Get-PMPathSize` are byte-for-byte the same traversal. An *idle*
 candidate gets no early exit from the first, so both run in full - and with 6a that is four full
@@ -252,6 +252,46 @@ cutoff and discard the partial size, since that candidate is skipped anyway.
 Also `plex-bif-orphans` materialises all 47,802 `FileInfo` plus a parallel HashSet (~35 MB), twice
 per apply run. Keep the re-walk - it re-verifies the `.bif` partner at delete time, which is the
 module's whole rule - and retain names rather than `FileInfo`.
+
+### 6a-6d closed 2026-09-10: measured 26.9s -> 15.6s on a report-only run
+
+Four items, one theme: the cost was never the filesystem, it was a cmdlet per candidate and a
+walk repeated for data already in hand. Each was measured before and after rather than reasoned
+about, and two designs the audit proposed were rejected on measurement.
+
+| item | change | measured |
+|---|---|---|
+| 6c | `Test-Path` -> `[IO.Directory]::Exists` in the two shared readers | 3,398 ms -> 280 ms over 6,405 paths (12x) |
+| 6b | native `EnumerateDirectories` + break, replacing a materialising `Get-PMChildDirectory` | 12,137 ms -> 458 ms (26x), same result |
+| 6b | one branched enumeration of the TEMP root where there were two | ~335 ms a pass, and fixes a `-Critical` asymmetry |
+| 6d | `Get-PMTreeStat` - one traversal for size AND age | removes a full second walk per selected candidate |
+| 6a | Test's measurements handed to Repair via `$ctx.KnownSizes` | removes the re-measure of every candidate on an apply run |
+
+**Two proposals were measured and rejected**, which is the part worth keeping:
+
+- *An mtime horizon on the payload-cache probe.* Useless here: 100% of the probe set was written
+  within a year and 90% within 180 days, so no cutoff short of a dangerous one helps.
+- *A persisted cache of the discovered payload-cache path*, which the audit recommended. Made
+  unnecessary by the native probe, and it would have bought a staleness window in which a newly
+  created cache goes unseen, plus state to keep correct.
+
+**What deliberately did NOT change.** Repair still re-derives its candidate list. Re-running every
+selection rule at delete time is what spares a directory that became active between the phases,
+and item 4's threat model assumes that window exists. Only the *measuring* was waste. Likewise
+`Get-PMTreeStat` holds no root policy, because the two callers genuinely disagree there and 6g is
+still open - a performance change is the wrong place to alter what gets selected.
+
+**Tests 220 -> 235.** Eight differential cases pin the fused walker against the behaviour it
+replaced (full sum, deepest-file age, early-exit incompleteness, and the four root kinds - file,
+missing, reparse-point, unreadable), because that is where this kind of refactor drifts without
+failing loudly. Six cover the size map, including an end-to-end run asserting it never reaches the
+run JSON, where an uncapped field would defeat the reason `Items` is capped at 25.
+
+And one gap the audit had not spotted: **nothing in the suite had ever run the dispatcher with
+`-Apply`**. The one path that actually deletes was covered only indirectly, and 6a changed how its
+byte total is computed. There is now a real fixture, a real apply run, and real deletion - with a
+deliberately wrong size in the map, since that is the only way to distinguish a cache hit from a
+silent fall-back to re-measuring.
 
 ### 6e. The read-error accumulator is uncapped and quadratic
 

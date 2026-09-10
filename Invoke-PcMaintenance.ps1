@@ -252,6 +252,16 @@ try {
                 Write-PMLog "$modId not removed - $reason" 'SKIP'; $results += $row; continue
             }
 
+            # Hand Test's measurements to Repair. The phases run in separate & {} child
+            # scopes, so $ctx is the only channel between them; without this Repair walks
+            # every selected tree again for a number taken seconds earlier.
+            #
+            # Onto the CONTEXT, never onto $row. The map is uncapped - that is the point -
+            # and $row becomes the run JSON, where Items is capped at 25 per module
+            # precisely to stop an unbounded field being written twice a run and kept 50
+            # runs deep. A test pins that sizes never appears in the JSON.
+            if ($t.PSObject.Properties['Sizes'] -and $t.Sizes -is [hashtable]) { $ctx.KnownSizes = $t.Sizes }
+
             $rw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Repair -Context $ctx -LibDir $libDir -Entry $info.Entry
             $r = $rw.Result
             $row.status = if ($r.Ok) { 'applied' } else { 'error' }

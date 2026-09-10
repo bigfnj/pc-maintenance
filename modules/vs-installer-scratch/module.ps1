@@ -16,7 +16,7 @@ function Get-VsScratchCandidates {
         Split out from Test so Repair reuses the identical selection instead of re-deriving it.
         Two paths that must agree is exactly the shape that drifts.
     #>
-    param([Parameter(Mandatory)][hashtable]$Context)
+    param([Parameter(Mandatory)][hashtable]$Context, [hashtable]$KnownSizes)
     $root = Get-VsScratchRoot -Context $Context
     $cut = (Get-Date).AddHours(-24)
     # List, not +=. Measured under 5.1 at 13,341 appends: 6,733 ms for += versus 248 ms here,
@@ -39,7 +39,7 @@ function Get-VsScratchCandidates {
             # directory that merely looks like scratch survives.
             if (-not (Test-PMPath -Path (Join-Path $d.FullName 'setup.exe'))) { continue }
             if (-not (Test-PMPath -Path (Join-Path $d.FullName 'resources\app\ServiceHub'))) { continue }
-            $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'extraction'; Bytes = (Get-PMPathSize -Path $d.FullName) })
+            $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'extraction'; Bytes = (Get-PMKnownOrMeasuredSize -Path $d.FullName -Known $KnownSizes) })
             continue
         }
 
@@ -81,7 +81,7 @@ function Get-VsScratchCandidates {
             if ($en -is [IDisposable]) { $en.Dispose() }
         }
         if (-not $hasVsix) { continue }
-        $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'payload-cache'; Bytes = (Get-PMPathSize -Path $d.FullName) })
+        $out.Add([pscustomobject]@{ Path = $d.FullName; Kind = 'payload-cache'; Bytes = (Get-PMKnownOrMeasuredSize -Path $d.FullName -Known $KnownSizes) })
     }
     return $out.ToArray()
 }
@@ -100,6 +100,10 @@ function Test-PMModule {
                     @($items | Where-Object Kind -eq 'extraction').Count,
                     @($items | Where-Object Kind -eq 'payload-cache').Count)
         Bytes  = $bytes
+        # Handed to Repair via the context so it does not re-measure what was just
+        # measured. In memory only - uncapped by design, and never serialized, which is
+        # why the dispatcher copies it to $ctx and not to the run row.
+        Sizes  = (ConvertTo-PMSizeMap -Items $items)
         # Capped like the other modules: 13,341 uncapped items produced a 4 MB run JSON, written
         # twice and retained 50 times over. The true number travels in Count.
         Items  = @($items | Sort-Object Bytes -Descending | Select-Object -First 25 | ForEach-Object { @{ path = $_.Path; kind = $_.Kind; bytes = $_.Bytes } })
@@ -109,14 +113,15 @@ function Test-PMModule {
 function Repair-PMModule {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root  = Get-VsScratchRoot -Context $Context
-    $items = @(Get-VsScratchCandidates -Context $Context)
+    $items = @(Get-VsScratchCandidates -Context $Context -KnownSizes $Context.KnownSizes)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes saves the walk inside Remove-PMPath. It does NOT carry a size over from
-        # Test: Repair re-derives candidates above, and that measures Bytes inline, so the
-        # number here is microseconds old rather than a phase old. The comment used to claim
-        # the saving was against Test, which was never true. Re-deriving is deliberate - it
-        # re-applies every selection rule at delete time - so only the sizing is waste.
+        # KnownBytes saves the walk inside Remove-PMPath, and the size itself now comes from
+        # Test via $Context.KnownSizes rather than being measured again here. Re-deriving the
+        # candidate LIST is still deliberate - it re-applies every selection rule at delete
+        # time, which is what spares a path that became active in between - but re-measuring
+        # it was pure waste. A candidate that appeared since Test is absent from the map and
+        # gets measured normally.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }

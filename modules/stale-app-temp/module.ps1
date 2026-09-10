@@ -20,7 +20,7 @@ function Get-StaleTempRoot {
 }
 
 function Get-StaleAppCandidates {
-    param([Parameter(Mandatory)][hashtable]$Context)
+    param([Parameter(Mandatory)][hashtable]$Context, [hashtable]$KnownSizes)
     $root = Get-StaleTempRoot -Context $Context
     $cut  = (Get-Date).AddDays(-$script:StaleDays)
     # List, not +=. The other three modules made this change after measuring it at 13,341
@@ -34,7 +34,7 @@ function Get-StaleAppCandidates {
         if (-not ($named -or $prefixed)) { continue }
         if ($d.LastWriteTime -ge $cut) { continue }
         $out.Add([pscustomobject]@{
-            Path = $d.FullName; Bytes = (Get-PMPathSize -Path $d.FullName)
+            Path = $d.FullName; Bytes = (Get-PMKnownOrMeasuredSize -Path $d.FullName -Known $KnownSizes)
             AgeDays = [int]((Get-Date) - $d.LastWriteTime).TotalDays
         })
     }
@@ -53,6 +53,10 @@ function Test-PMModule {
         Count  = @($items).Count
         Detail = ('{0} stale app folder(s), oldest {1}d' -f @($items).Count, (@($items | Measure-Object AgeDays -Maximum).Maximum))
         Bytes  = $bytes
+        # Handed to Repair via the context so it does not re-measure what was just
+        # measured. In memory only - uncapped by design, and never serialized, which is
+        # why the dispatcher copies it to $ctx and not to the run row.
+        Sizes  = (ConvertTo-PMSizeMap -Items $items)
         # Capped like the other three. This was the ONE uncapped Items in the run JSON, and the
         # combination that makes that dangerous is specific to this module: its 7zO* and
         # pip-unpack-* prefixes recur without limit, and AutoApply = $false means it never
@@ -70,14 +74,15 @@ function Repair-PMModule {
     # against. Written correctly anyway rather than left to throw: a Repair that exists but is
     # wrong is worse than one that is never called.
     $root  = Get-StaleTempRoot -Context $Context
-    $items = @(Get-StaleAppCandidates -Context $Context)
+    $items = @(Get-StaleAppCandidates -Context $Context -KnownSizes $Context.KnownSizes)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes saves the walk inside Remove-PMPath. It does NOT carry a size over from
-        # Test: Repair re-derives candidates above, and that measures Bytes inline, so the
-        # number here is microseconds old rather than a phase old. The comment used to claim
-        # the saving was against Test, which was never true. Re-deriving is deliberate - it
-        # re-applies every selection rule at delete time - so only the sizing is waste.
+        # KnownBytes saves the walk inside Remove-PMPath, and the size itself now comes from
+        # Test via $Context.KnownSizes rather than being measured again here. Re-deriving the
+        # candidate LIST is still deliberate - it re-applies every selection rule at delete
+        # time, which is what spares a path that became active in between - but re-measuring
+        # it was pure waste. A candidate that appeared since Test is absent from the map and
+        # gets measured normally.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }

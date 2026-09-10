@@ -47,7 +47,7 @@ function Get-AgentSessionDirectory {
 }
 
 function Get-AgentScratchCandidates {
-    param([Parameter(Mandatory)][hashtable]$Context)
+    param([Parameter(Mandatory)][hashtable]$Context, [hashtable]$KnownSizes)
     $root = Get-AgentScratchRoot -Context $Context
     if (-not (Test-PMPath -Path $root)) { return @() }
     $cutUtc = (Get-Date).ToUniversalTime().AddDays(-$script:AgentIdleDays)
@@ -67,7 +67,9 @@ function Get-AgentScratchCandidates {
         # Complete is true here by construction: an early exit means it beat the cutoff, and that
         # path just took the `continue` above. Asserted rather than assumed, because reading a
         # partial Bytes would under-report what a deletion frees.
-        $bytes = if ($stat.Complete -and $stat.RootKind -eq 'dir') { [int64]$stat.Bytes } else { Get-PMPathSize -Path $s.FullName }
+        $bytes = if ($KnownSizes -and $KnownSizes.ContainsKey($s.FullName)) { [int64]$KnownSizes[$s.FullName] }
+                 elseif ($stat.Complete -and $stat.RootKind -eq 'dir') { [int64]$stat.Bytes }
+                 else { Get-PMPathSize -Path $s.FullName }
         $out.Add([pscustomobject]@{
             Path     = $s.FullName
             Bytes    = $bytes
@@ -95,6 +97,10 @@ function Test-PMModule {
         Detail = ('{0} session(s) idle >{1}d across {2} project(s)' -f
                     @($items).Count, $script:AgentIdleDays, @($items | Select-Object -ExpandProperty Project -Unique).Count)
         Bytes  = $bytes
+        # Handed to Repair via the context so it does not re-measure what was just
+        # measured. In memory only - uncapped by design, and never serialized, which is
+        # why the dispatcher copies it to $ctx and not to the run row.
+        Sizes  = (ConvertTo-PMSizeMap -Items $items)
         Items  = @($items | Sort-Object Bytes -Descending | Select-Object -First 25 | ForEach-Object {
                     @{ path = $_.Path; bytes = $_.Bytes; idleDays = $_.IdleDays; project = $_.Project } })
     }
@@ -103,7 +109,7 @@ function Test-PMModule {
 function Repair-PMModule {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root  = Get-AgentScratchRoot -Context $Context
-    $items = @(Get-AgentScratchCandidates -Context $Context)
+    $items = @(Get-AgentScratchCandidates -Context $Context -KnownSizes $Context.KnownSizes)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `

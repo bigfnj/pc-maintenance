@@ -27,7 +27,7 @@ function Get-PlexMediaRoot {
 }
 
 function Get-PlexOrphanCandidates {
-    param([Parameter(Mandatory)][hashtable]$Context)
+    param([Parameter(Mandatory)][hashtable]$Context, [hashtable]$KnownSizes)
     $root = Get-PlexMediaRoot -Context $Context
     if (-not (Test-PMPath -Path $root)) { return @() }
     # ONE walk, unfiltered, into a set. Two reasons beyond speed:
@@ -72,6 +72,10 @@ function Test-PMModule {
         Count  = @($items).Count
         Detail = ('{0} .tmp file(s) whose finished preview already exists' -f @($items).Count)
         Bytes  = $bytes
+        # Handed to Repair via the context so it does not re-measure what was just
+        # measured. In memory only - uncapped by design, and never serialized, which is
+        # why the dispatcher copies it to $ctx and not to the run row.
+        Sizes  = (ConvertTo-PMSizeMap -Items $items)
         # Item paths are capped: 6,935 of them would bloat every run json for no added insight.
         Items  = @($items | Select-Object -First 25 | ForEach-Object { @{ path = $_.Path; bytes = $_.Bytes } })
     }
@@ -80,14 +84,15 @@ function Test-PMModule {
 function Repair-PMModule {
     param([Parameter(Mandatory)][hashtable]$Context)
     $root  = Get-PlexMediaRoot -Context $Context
-    $items = @(Get-PlexOrphanCandidates -Context $Context)
+    $items = @(Get-PlexOrphanCandidates -Context $Context -KnownSizes $Context.KnownSizes)
     $freed = [int64]0; $removed = 0; $vetoed = 0; $locked = 0; $gone = 0
     foreach ($i in $items) {
-        # KnownBytes saves the walk inside Remove-PMPath. It does NOT carry a size over from
-        # Test: Repair re-derives candidates above, and that measures Bytes inline, so the
-        # number here is microseconds old rather than a phase old. The comment used to claim
-        # the saving was against Test, which was never true. Re-deriving is deliberate - it
-        # re-applies every selection rule at delete time - so only the sizing is waste.
+        # KnownBytes saves the walk inside Remove-PMPath, and the size itself now comes from
+        # Test via $Context.KnownSizes rather than being measured again here. Re-deriving the
+        # candidate LIST is still deliberate - it re-applies every selection rule at delete
+        # time, which is what spares a path that became active in between - but re-measuring
+        # it was pure waste. A candidate that appeared since Test is absent from the map and
+        # gets measured normally.
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }

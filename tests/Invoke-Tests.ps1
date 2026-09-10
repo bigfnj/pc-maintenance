@@ -1704,6 +1704,149 @@ It 'an EMPTY directory still dates from itself rather than reading as ancient' {
     } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== Test measures once, Repair reuses it, and the map never reaches disk ==" -ForegroundColor Cyan
+
+It 'ConvertTo-PMSizeMap keys every candidate by path' {
+    $m = ConvertTo-PMSizeMap -Items @(
+        [pscustomobject]@{ Path = 'C:\a'; Bytes = 10 },
+        [pscustomobject]@{ Path = 'C:\b'; Bytes = 20 })
+    ($m.Count -eq 2) -and ($m['C:\a'] -eq 10) -and ($m['C:\b'] -eq 20)
+}
+It 'and tolerates junk without inventing entries' {
+    $m = ConvertTo-PMSizeMap -Items @($null, [pscustomobject]@{ Bytes = 5 }, [pscustomobject]@{ Path = 'C:\c'; Bytes = 7 })
+    ($m.Count -eq 1) -and ($m['C:\c'] -eq 7)
+}
+It 'Get-PMKnownOrMeasuredSize prefers the cached size' {
+    # Deliberately a wrong number: if it measured instead of trusting the map, this fails.
+    (Get-PMKnownOrMeasuredSize -Path 'C:\Windows' -Known @{ 'C:\Windows' = 4242 }) -eq 4242
+}
+It 'and MEASURES a path the map does not know, rather than reporting zero' {
+    # A candidate that appeared between the phases. Zero here would under-report what the run
+    # freed, in the record this project uses instead of a backup.
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-km-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $d 'f.bin') -Value ('x' * 512) -Encoding Ascii -NoNewline
+        (Get-PMKnownOrMeasuredSize -Path $d -Known @{ 'C:\somewhere\else' = 1 }) -eq 512
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a null map measures normally, so an un-wired caller is not silently zeroed' {
+    $d = Join-Path ([IO.Path]::GetTempPath()) ("pm-km2-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $d 'f.bin') -Value ('x' * 256) -Encoding Ascii -NoNewline
+        (Get-PMKnownOrMeasuredSize -Path $d -Known $null) -eq 256
+    } finally { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+It 'end to end: the size map is handed to Repair and kept OUT of the run JSON' {
+    # The map is uncapped on purpose, which is exactly why it must never be serialized: Items is
+    # capped at 25 per module to stop an unbounded field being written twice a run and retained
+    # 50 runs deep. This runs the real dispatcher and inspects the real JSON.
+    $fx = New-PMFixtureRoot -Prefix "pm-sz-"
+    $md = Join-Path $fx 'modules\sizemod'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $root 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+    @'
+@{ Id='sizemod'; Name='Sizes'; Category='maintenance'; Version='1.0.0'; RequiresUserSid=$false
+   AutoApply=$false; Roots=@('C:\nowhere'); Entry='module.ps1'; Description='fixture' }
+'@ | Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+    @'
+function Test-PMModule {
+    param($Context)
+    $items = @([pscustomobject]@{ Path = 'C:\fake\one'; Bytes = 111 },
+               [pscustomobject]@{ Path = 'C:\fake\two'; Bytes = 222 })
+    [pscustomobject]@{
+        Clean = $false; Count = 2; Detail = 'two fake items'; Bytes = [int64]333
+        Items = @($items | ForEach-Object { @{ path = $_.Path; bytes = $_.Bytes } })
+        Sizes = (ConvertTo-PMSizeMap -Items $items)
+    }
+}
+function Repair-PMModule { param($Context) [pscustomobject]@{ Ok=$true; Bytes=[int64]0; Detail='' } }
+'@ | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"sizemod","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fx 'Invoke-PcMaintenance.ps1') -NoReport 2>&1
+        $raw = Get-Content -LiteralPath (Join-Path $fx 'logs\latest.json') -Raw
+        $j = $raw | ConvertFrom-Json
+        # The module still reports normally...
+        $reported = ($j.modules[0].status -eq 'reported' -and $j.modules[0].count -eq 2)
+        # ...and the map is nowhere in the serialized record, by field or by content.
+        $noField = -not ($j.modules[0].PSObject.Properties.Name -contains 'sizes')
+        $noLeak  = ($raw -notmatch '(?i)"sizes"')
+        return ($reported -and $noField -and $noLeak)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Write-Host "`n== an APPLY run really deletes, and bills it from Test's measurement ==" -ForegroundColor Cyan
+It 'apply removes the files and reports freed bytes from the size map' {
+    # Nothing in this suite ran the dispatcher with -Apply before, which left the one path that
+    # actually deletes covered only indirectly - and BACKLOG 6a changed how its byte total is
+    # computed. So: a real fixture, a real -Apply run, real deletion.
+    #
+    # The map deliberately carries a WRONG size (1000 per item, against 300 real bytes). That is
+    # the only way to prove Repair consulted it rather than re-measuring: if the plumbing were
+    # broken it would silently fall back to measuring and report 600, which looks correct.
+    $fx = New-PMFixtureRoot -Prefix "pm-apply-"
+    $data = Join-Path $fx 'data'
+    $md = Join-Path $fx 'modules\applymod'
+    New-Item -ItemType Directory -Path $md -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $data 'one') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $data 'two') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $data 'one\f.bin') -Value ('x' * 300) -Encoding Ascii -NoNewline
+    Set-Content -LiteralPath (Join-Path $data 'two\f.bin') -Value ('x' * 300) -Encoding Ascii -NoNewline
+    Copy-Item -LiteralPath (Join-Path $root 'lib') -Destination (Join-Path $fx 'lib') -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $root 'Invoke-PcMaintenance.ps1') -Destination $fx -Force
+
+    # Roots must be literal here: Expand-PMRoot only substitutes environment tokens.
+    "@{ Id='applymod'; Name='Apply'; Category='maintenance'; Version='1.0.0'; RequiresUserSid=`$false
+   AutoApply=`$true; Roots=@('$data'); Entry='module.ps1'; Description='fixture' }" |
+        Set-Content -LiteralPath (Join-Path $md 'module.psd1') -Encoding UTF8
+
+    "`$script:DataRoot = '$data'
+function Get-Candidates {
+    param(`$Context, [hashtable]`$KnownSizes)
+    `$out = @()
+    foreach (`$d in (Get-PMChildDirectory -Path `$script:DataRoot -Critical)) {
+        `$out += [pscustomobject]@{ Path = `$d.FullName
+                                   Bytes = (Get-PMKnownOrMeasuredSize -Path `$d.FullName -Known `$KnownSizes) }
+    }
+    return `$out
+}
+function Test-PMModule {
+    param(`$Context)
+    `$items = @(Get-Candidates -Context `$Context)
+    # A wrong-on-purpose map: 1000 each, so a cache hit is distinguishable from a re-measure.
+    `$map = @{}
+    foreach (`$i in `$items) { `$map[`$i.Path] = [int64]1000 }
+    [pscustomobject]@{ Clean = `$false; Count = @(`$items).Count; Detail = 'fixture'
+                       Bytes = [int64]600; Items = @(); Sizes = `$map }
+}
+function Repair-PMModule {
+    param(`$Context)
+    `$items = @(Get-Candidates -Context `$Context -KnownSizes `$Context.KnownSizes)
+    `$freed = [int64]0; `$removed = 0; `$vetoed = 0
+    foreach (`$i in `$items) {
+        `$r = Remove-PMPath -Path `$i.Path -Roots @(`$script:DataRoot) -DeclaredRoots @(`$Context.DeclaredRoots) -KnownBytes ([int64]`$i.Bytes)
+        if (`$r.Removed) { `$removed++; `$freed += [int64]`$r.Bytes } else { `$vetoed++ }
+    }
+    [pscustomobject]@{ Ok = (`$vetoed -eq 0); Bytes = `$freed; Detail = ('removed {0}' -f `$removed) }
+}" | Set-Content -LiteralPath (Join-Path $md 'module.ps1') -Encoding UTF8
+
+    '{ "schemaVersion":1, "allowedCategories":["maintenance"], "modules":[{"id":"applymod","enabled":true,"order":10}] }' |
+        Set-Content -LiteralPath (Join-Path $fx 'pcmaintenance.manifest.json') -Encoding UTF8
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fx 'Invoke-PcMaintenance.ps1') -Apply -NoReport 2>&1
+        $j = Get-Content -LiteralPath (Join-Path $fx 'logs\latest.json') -Raw | ConvertFrom-Json
+        $gone = -not (Test-Path -LiteralPath (Join-Path $data 'one')) -and -not (Test-Path -LiteralPath (Join-Path $data 'two'))
+        # 2000, not 600: proof the cached size was used rather than re-measured.
+        return ($j.mode -eq 'apply' -and $j.modules[0].status -eq 'applied' -and
+                [int64]$j.summary.bytes -eq 2000 -and $gone)
+    } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }
 Write-Host ("`n{0} passed, {1} failed{2}`n" -f $script:Pass, $script:Fail, $tail) -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 exit $(if ($script:Fail) { 1 } else { 0 })

@@ -413,6 +413,43 @@ function Test-PMPath { param([Parameter(Mandatory)][AllowEmptyString()][string]$
     Test-Path -LiteralPath $Path
 }
 
+function ConvertTo-PMSizeMap {
+    <#
+        Build the path -> bytes map a module's Test phase hands forward to its Repair phase.
+
+        Repair re-derives its candidate list rather than trusting Test's, and that MUST stay:
+        re-running every selection rule at delete time is what spares a directory that became
+        active in between, and BACKLOG item 4's threat model assumes the window exists. What
+        does not need repeating is the MEASURING - Get-PMPathSize walks the whole tree again for
+        a number taken seconds earlier.
+
+        Uncapped on purpose, and in memory only. Items is capped at 25 per module so a
+        6,935-orphan run does not bloat the run JSON; this map would break that rule if it ever
+        reached disk, so the dispatcher moves it onto the context and never into the row. A test
+        pins that it stays out of the JSON.
+    #>
+    param($Items)
+    $h = @{}
+    foreach ($i in @($Items)) {
+        if ($null -ne $i -and $i.Path) { $h[[string]$i.Path] = [int64]$i.Bytes }
+    }
+    return $h
+}
+
+function Get-PMKnownOrMeasuredSize {
+    <#
+        The size from Test if we have it, otherwise measure it now.
+
+        A path absent from the map is one that appeared BETWEEN the phases, so it was never
+        measured and must be. Falling back rather than defaulting to zero matters: zero would
+        under-report what the run freed, and the run JSON is this project's substitute for a
+        backup.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [hashtable]$Known)
+    if ($Known -and $Known.ContainsKey($Path)) { return [int64]$Known[$Path] }
+    return (Get-PMPathSize -Path $Path)
+}
+
 function Get-PMTreeStat {
     <#
         ONE traversal that answers both questions a module asks about a directory: how big is it
