@@ -1855,6 +1855,49 @@ function Repair-PMModule {
     } finally { Remove-Item -LiteralPath $fx -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Write-Host "`n== 8.3 short names must not slip past the forbidden list (BACKLOG 6k) ==" -ForegroundColor Cyan
+It 'the guard alone is fooled by a short name - the reason the resolve exists' {
+    # Documents the hazard rather than the fix, so the next person can see WHY Remove-PMPath
+    # resolves before it checks. Measured under both 5.1 and 7: identical directory, one name
+    # refused and the other allowed.
+    (Test-PMPathSafe -Path 'C:\PROGRA~1\x' -Roots @('C:\')) -and
+    (-not (Test-PMPathSafe -Path 'C:\Program Files\x' -Roots @('C:\')))
+}
+It 'the resolve step turns a real short name into its long form' {
+    # No fixture is possible: 8.3 generation is disabled for new files on this volume, so
+    # `dir /x` returns no alias to test with. Legacy names like PROGRA~1 still exist, and the
+    # resolve is exercised against one - WITHOUT ever pointing Remove-PMPath at a system
+    # directory, which would risk deleting Program Files if the guard regressed.
+    if (-not (Test-Path -LiteralPath 'C:\PROGRA~1')) { return 'SKIP' }
+    (New-Object System.IO.DirectoryInfo('C:\PROGRA~1')).FullName -eq 'C:\Program Files'
+}
+It 'and GetFullPath alone cannot be relied on for it, which is why the resolve exists' {
+    # The reason this is belt AND braces. .NET expands some short paths and not others, with no
+    # obvious rule: measured on this box, C:\PROGRA~1\__nope__ comes back expanded while
+    # C:\PROGRA~1\x does not. Both under 5.1 and 7. A guard that depends on which of those you
+    # happen to be handed is not a guard.
+    if (-not (Test-Path -LiteralPath 'C:\PROGRA~1')) { return 'SKIP' }
+    ([IO.Path]::GetFullPath('C:\PROGRA~1\x') -eq 'C:\PROGRA~1\x') -and
+    ([IO.Path]::GetFullPath('C:\PROGRA~1\__nope__') -eq 'C:\Program Files\__nope__')
+}
+It 'a short path that does not exist is refused or reported gone, never deleted' {
+    # The remaining hole is closed by arithmetic rather than by the guard: a path that cannot
+    # be resolved is a path that does not exist, and Remove-PMPath will not delete one.
+    $r = Remove-PMPath -Path 'C:\PROGRA~1\__pm_does_not_exist__' -Roots @('C:\') -DeclaredRoots @('C:\')
+    (-not $r.Removed) -and ($r.Skipped)
+}
+It 'and an ordinary long path is still removable after the resolve' {
+    # Positive control: resolving must not break the normal case.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm83b-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $t = Join-Path $base 'ordinary'
+    New-Item -ItemType Directory -Path $t -Force | Out-Null
+    try {
+        Set-Content -LiteralPath (Join-Path $t 'f.txt') -Value 'x' -Encoding UTF8
+        $r = Remove-PMPath -Path $t -Roots @($base) -DeclaredRoots @($base)
+        $r.Removed -and -not (Test-Path -LiteralPath $t)
+    } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Write-Host "`n== the payload ACL check covers what it claims to (BACKLOG 6j) ==" -ForegroundColor Cyan
 function New-PMAclProbe {
     param([string]$Sub)

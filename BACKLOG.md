@@ -293,7 +293,7 @@ byte total is computed. There is now a real fixture, a real apply run, and real 
 deliberately wrong size in the map, since that is the only way to distinguish a cache hit from a
 silent fall-back to re-measuring.
 
-### 6e. The read-error accumulator is uncapped and quadratic
+### 6e. ~~The read-error accumulator is uncapped and quadratic~~ DONE
 
 `Add-PMReadError` appends with `+=` inside per-directory walk loops and **nothing ever consumes
 the retained `ErrorRecord` objects** - only the counts, one sample and ≤10 deduped messages are
@@ -302,7 +302,7 @@ shape measured at 6,733 ms), and each record carries an `InvocationInfo` at roug
 100k of them is 100-300 MB held in a SYSTEM process. A cap of ~200 retained plus a monotonic
 counter costs nothing. Normal runs are unaffected - current logs show `readErrors: 1`.
 
-### 6f. Test fixtures stranded on the throw path, and they are un-deletable
+### 6f. ~~Test fixtures stranded on the throw path, and they are un-deletable~~ DONE
 
 Eight sites create and populate a fixture *before* the `try` whose `finally` removes it, so
 anything throwing in between strands it. Worse than an ordinary temp leak: `New-PMFixtureRoot`
@@ -312,7 +312,7 @@ allowlist, so this tool will never clean it up either. Move the construction ins
 Related: `icacls /reset` is invoked bare in a `finally`; if it throws, the Deny-ACE'd directory
 survives.
 
-### 6g. `Get-PMNewestWriteUtc` does not reparse-guard its ROOT push
+### 6g. ~~`Get-PMNewestWriteUtc` does not reparse-guard its ROOT push~~ DONE
 
 `Get-PMPathSize` checks the top-level attribute and returns 0 for a reparse-point root;
 `Get-PMNewestWriteUtc` pushes `$Path` unconditionally and only checks *sub*directories. So for a
@@ -322,7 +322,7 @@ different things. Now that `Test-PMPathTraversesLink` blocks the dangerous case 
 consistency defect rather than a hole, but the stated invariant is that measurement matches what
 deletion frees.
 
-### 6h. Two numbers share a word and count different things
+### 6h. ~~Two numbers share a word and count different things~~ DONE
 
 `summary.found` counts every module that found something (`reported` **and** `applied`); the HTML
 "Found" tile counts only `reported`. On an apply run where all three permitted modules act, the
@@ -352,7 +352,7 @@ between prose and behaviour rather than softening the prose:
   nothing stops a module calling it from `Test-PMModule`. Gates 1-3 live entirely in the
   dispatcher.
 
-### 6j. `Test-PMPayloadSecure` has three gaps in the check the README calls load-bearing
+### 6j. ~~`Test-PMPayloadSecure` has three gaps in the check the README calls load-bearing~~ DONE
 
 It trusts `S-1-5-19`/`S-1-5-20` (LOCAL SERVICE / NETWORK SERVICE) as "already privileged enough",
 which is untrue - they are restricted accounts strictly below SYSTEM, so a write ACE for
@@ -362,7 +362,7 @@ a standard user passes with a perfectly locked DACL. And it checks the payload r
 every `.ps1` under `lib\` is dot-sourced twice per run, so a permissive ACE placed directly on
 `lib\` with inheritance disabled is invisible to it.
 
-### 6k. Smaller, each cheap
+### 6k. ~~Smaller, each cheap~~ MOSTLY DONE
 
 - **`Get-PMDownloadsPath` trusts a user-writable registry value.** Under SYSTEM that is a
   file-creation primitive into any existing directory. Bounded - the filename is fixed and
@@ -402,6 +402,53 @@ every `.ps1` under `lib\` is dot-sourced twice per run, so a permissive ACE plac
   parameter. Same shape: `Remove-PMPath -MinDepth` and `Get-PMReadErrorMessages -Max` are never
   passed by any caller, so three tuning knobs in the deletion path are only ever exercised at
   their defaults.
+
+### 6e-6k closed 2026-09-10, except 6i
+
+Tests 235 -> 254. What each change actually was is in the commits; this records the parts that
+are only obvious once you have been bitten.
+
+**Every one of the three "fixes" below broke something on the way in**, which is the argument
+for the differential tests rather than for cleverness:
+
+- Capping the read-error accumulator (6e) took out **eight tests at once**. `@()` around an
+  EMPTY generic `List` throws *"Argument types do not match"* - harmless while the collection
+  was a plain array, fatal the moment it became `List[object]`, and it hit every accessor that
+  merely wanted to read an error message.
+- The 6g test was written with `(Get-Item $link -Force).LastWriteTimeUtc = $x`, which stamps
+  the **target** under 5.1 and the **link** under 7. It passed under 7 and failed under 5.1 -
+  the version the scheduled task runs. The production code was right the whole time.
+- The 6j `lib\` test was a permanent SKIP because setting inheritance protection and adding an
+  ACE in two separate `Set-Acl` calls needs `SeSecurityPrivilege` on the second. One `Set-Acl`
+  doing both works. A skipping test is the "verifies nothing" outcome this suite exists to avoid.
+
+**On 8.3 short names (6k).** The audit said `GetFullPath` does not expand them. Measured, it
+expands *some*: `C:\PROGRA~1\__nope__` comes back long, `C:\PROGRA~1\x` does not, under both 5.1
+and 7. A guard that depends on which one it is handed is not a guard, so `Remove-PMPath` now
+resolves to the long form itself before any check sees the path. No fixture was possible - 8.3
+generation is disabled for new files on this volume - so it is proven against a real legacy name
+without ever pointing a delete at a system directory.
+
+**Deliberately left, with reasons:**
+
+- **`\??\` is still uncovered by the `^\\\\` rule.** It cannot match any declared root and Win32
+  refuses to open it, so it fails closed twice over. Recorded rather than patched, because a
+  rule no input can reach is the thing item 2 was about.
+- **The two redundant `AppData\Roaming` credential alternatives stay.** The patterns are correct;
+  what is weak is that the two tests naming them pass with the alternatives deleted. That is a
+  test-coverage gap, not a guard gap.
+- **The other five unused context keys stay** (`UserSid`, `PayloadRoot`, `ModuleRoot`, `LibDir`,
+  `RunId`). Only `IsInteractiveUserLoggedIn` was removed, because it duplicated a gate the
+  dispatcher had *already applied* and so invited a module to decide it again locally. The rest
+  are plausible for a module that needs to write state, and cost nothing.
+- **`-WhatIfOnly` stays** though no module passes it. design.md no longer claims it is
+  load-bearing, which was the actual defect.
+
+**Still open: 6i** - three guarantees the README states more strongly than the code provides
+(gate 3 is opt-in via `RequiresUserSid`; `DeclaredRoots` is module-*mediated*; `Remove-PMPath`
+enforces only gate 4). All three are unreachable through the four shipped modules. Left alone
+deliberately: closing them means either tightening the code or softening the prose, and that is
+a design call rather than a defect to fix.
 
 ### 6l. The one that is a note, not a finding
 

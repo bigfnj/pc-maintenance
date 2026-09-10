@@ -474,10 +474,14 @@ function Get-PMChildDirectory {
 }
 
 function Get-PMChildFile {
-    param([Parameter(Mandatory)][string]$Path, [string]$Filter = '*', [switch]$Recurse, [switch]$Critical)
+    # No -Filter. It had no caller, and the one that existed dropped it deliberately: the
+    # Win32 filter matches on the 8.3 name too, so -Filter '*.tmp' also returns .tmpx -
+    # exactly the bug BACKLOG item 1 mutation-tested out of plex-bif-orphans. Leaving the
+    # parameter exposed invited a future module to walk back into it. Filter in the caller.
+    param([Parameter(Mandatory)][string]$Path, [switch]$Recurse, [switch]$Critical)
     if (-not ([IO.Directory]::Exists($Path) -or [IO.File]::Exists($Path))) { return @() }
     $ev = $null
-    $r = @(Get-ChildItem -LiteralPath $Path -Force -File -Filter $Filter -Recurse:$Recurse -ErrorAction SilentlyContinue -ErrorVariable ev)
+    $r = @(Get-ChildItem -LiteralPath $Path -Force -File -Recurse:$Recurse -ErrorAction SilentlyContinue -ErrorVariable ev)
     Add-PMReadError -Errors $ev -Critical:$Critical
     return $r
 }
@@ -759,12 +763,23 @@ function Expand-PMRoot {
     if ($UserProfile) {
         # A .NET replacement string only treats $ specially. Escaping backslashes here and
         # then stripping them turned a profile path into a drive-relative one.
-        $r = $r -replace '(?i)%USERPROFILE%', ($UserProfile -replace '\$', '$$$$')
-        $r = $r -replace '(?i)%LOCALAPPDATA%', ($UserProfile + '\AppData\Local')
-        $r = $r -replace '(?i)%APPDATA%', ($UserProfile + '\AppData\Roaming')
+        #
+        # The escape now covers ALL THREE branches. It used to guard only %USERPROFILE% while
+        # the other two concatenated $UserProfile raw, so `$&`, `` $` ``, `$'` and `$1`-`$9` in
+        # a profile path - all legal NTFS characters - were read as substitution tokens. It
+        # failed closed (the result became a nonexistent root, and the %...% residue check
+        # below then refused it), but silently: every module would have dropped to report-only
+        # for that user with no indication why.
+        $safeProfile = ($UserProfile -replace '\$', '$$$$')
+        $r = $r -replace '(?i)%USERPROFILE%', $safeProfile
+        $r = $r -replace '(?i)%LOCALAPPDATA%', ($safeProfile + '\AppData\Local')
+        $r = $r -replace '(?i)%APPDATA%', ($safeProfile + '\AppData\Roaming')
     }
     $r = [Environment]::ExpandEnvironmentVariables($r)
-    if ($r -match '%[A-Za-z_]+%') { return '' }   # unresolved token: refuse rather than guess
+    # %[^%]+% rather than %[A-Za-z_]+%: the old class missed %FOO2% and %MY_VAR1%, which
+    # were returned literally instead of refused. Still fails closed either way - a
+    # nonexistent root matches nothing - but 'refuse rather than guess' was only half true.
+    if ($r -match '%[^%]+%') { return '' }   # unresolved token: refuse rather than guess
     return (Resolve-PMReparsePoint -Path $r)
 }
 
@@ -794,6 +809,28 @@ function Remove-PMPath {
         [switch]$WhatIfOnly,
         [int]$MinDepth = 2   # DIRECTORIES below the drive; see Test-PMPathSafe
     )
+    # Resolve 8.3 SHORT NAMES before any guard looks at the path.
+    #
+    # Every pattern in the forbidden list matches on NAME, and a short name defeats all of them
+    # at once. Measured: Test-PMPathSafe allows C:\PROGRA~1\x while refusing C:\Program Files\x,
+    # under 5.1 as well as 7. Inside a declared root the same trick reaches DOCKER~1 past a rule
+    # written for DockerDesktop.
+    #
+    # Not reachable through the four shipped modules, which hand over enumerated .FullName and
+    # therefore always long form - but -PayloadRoot is operator input, and the first module to
+    # take a path from config or an environment variable would be exposed with nothing to catch
+    # it. Done HERE rather than in Test-PMPathSafe because it costs a filesystem call (~0.4 ms)
+    # and Test-PMPathSafe runs per candidate, while this runs per deletion.
+    #
+    # Only an existing path can be expanded, which is exactly the case that matters: nothing
+    # else can be deleted.
+    $long = $Path
+    try {
+        if ([IO.Directory]::Exists($Path))  { $long = (New-Object System.IO.DirectoryInfo($Path)).FullName }
+        elseif ([IO.File]::Exists($Path))   { $long = (New-Object System.IO.FileInfo($Path)).FullName }
+    } catch { }
+    if ($long -ne $Path) { $Path = $long }
+
     if (-not (Test-PMPathSafe -Path $Path -Roots $Roots -MinDepth $MinDepth)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'refused by path guard'; Bytes = [int64]0 }
     }

@@ -178,8 +178,12 @@ try {
                 PayloadRoot = $PayloadRoot; ModuleRoot = $modDir; LibDir = $libDir
                 RunId = $runId; Apply = $mayApply
                 DeclaredRoots = $declaredRoots
-                IsInteractiveUserLoggedIn = $user.LoggedIn
             }
+            # IsInteractiveUserLoggedIn used to be here and was read by nothing. Removed rather
+            # than left: it duplicates a fact the dispatcher has ALREADY acted on - gate 3 is
+            # applied above, before this context is built - so its only effect was to invite a
+            # module to make that decision again, locally, as a second copy of a gate that is
+            # deliberately not module-controlled.
 
             $tw = Invoke-PMModulePhase -ModuleDir $modDir -Phase Test -Context $ctx -LibDir $libDir -Entry $info.Entry
             $t = $tw.Result
