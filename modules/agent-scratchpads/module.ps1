@@ -98,12 +98,13 @@ function Repair-PMModule {
         $r = Remove-PMPath -Path $i.Path -Roots @($root) -DeclaredRoots @($Context.DeclaredRoots) `
                            -KnownBytes ([int64]$i.Bytes)
         if ($r.Removed) { $removed++; $freed += [int64]$r.Bytes; continue }
-        switch -Wildcard ($r.Reason) {
-            '*refused*'  { $vetoed++ }
-            '*outside*'  { $vetoed++ }
-            '*declared*' { $vetoed++ }
-            'gone'       { $gone++ }
-            default      { $locked++ }
+        # One shared mapping in PMCommon, not a copy per module. This module was the only one
+        # that had the '*declared*' arm; the other three counted that refusal as 'locked', which
+        # left Ok = ($vetoed -eq 0) TRUE over a run the guard had refused outright.
+        switch (Get-PMRemovalBucket -Reason $r.Reason) {
+            'vetoed' { $vetoed++ }
+            'gone'   { $gone++ }
+            default  { $locked++ }
         }
     }
     [pscustomobject]@{

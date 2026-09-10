@@ -132,9 +132,12 @@ $script:PMForbiddenPathPatterns = @(
     '^\\\\'
     '\\DockerDesktop($|\\)'
     '\\docker\\volumes($|\\)'
-    # \wsl\ only ever matched a directory literally named "wsl". The real WSL shares are UNC and
-    # are covered by the ^\\\\ rule above; this stays for a local mount point of that name.
-    '\\wsl\\'
+    # A local mount point literally named "wsl". The real WSL shares are UNC and are covered by
+    # the ^\\\\ rule above. This was '\\wsl\\', which required a TRAILING backslash and so
+    # protected everything under the directory while leaving the directory ITSELF deletable -
+    # the one target whose removal destroys all of it. Every other container rule here uses the
+    # ($|\\) form; this was the only one that did not.
+    '\\wsl($|\\)'
     '\\\.git($|\\)'
     '\\site-packages($|\\)'
     '\\node_modules($|\\)'
@@ -177,6 +180,48 @@ function Test-PMPathSafe {
         $root = try { [IO.Path]::GetFullPath($r).TrimEnd('\') } catch { continue }
         if ($full.Equals($root, 'OrdinalIgnoreCase')) { return $false }   # never the root itself
         if ($full.StartsWith($root + '\', 'OrdinalIgnoreCase')) { return $true }
+    }
+    return $false
+}
+
+function Test-PMPathTraversesLink {
+    <#
+        Does this path REACH its target through a junction or symlink?
+
+        Test-PMPathSafe compares strings. A string can look perfectly contained inside a declared
+        root while resolving into another volume entirely, and that is not a hypothetical:
+        agent-scratchpads enumerates in two non-recursive passes, so a junction at the
+        project-slug level under Temp\claude let it hand Remove-PMPath a path of the form
+        <root>\<junction>\<session-guid>. That path passed BOTH halves of the guard, and
+        Remove-Item -Recurse then followed the link and destroyed the real tree while the
+        junction itself survived. Reproduced end to end before this function existed.
+
+        BACKLOG item 4 had closed that case as unreachable, reasoning that "Get-ChildItem
+        -Recurse does not descend junctions, so no module can enumerate one". The measurement
+        was sound and the conclusion did not follow: this module never uses -Recurse.
+
+        Only the INTERMEDIATE directories are checked, never the target itself. Remove-Item
+        -Recurse on a reparse point deletes the LINK and leaves the target alone (item 4's own
+        cases A and B, both measured "survived"), so a stale junction stays cleanable.
+
+        Fails closed: a directory we cannot inspect is treated as a link.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Root
+    )
+    $rootFull = try { [IO.Path]::GetFullPath($Root).TrimEnd('\') } catch { return $true }
+    $cur      = try { [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { return $true }
+    $cur = Split-Path -Parent $cur      # start above the target; the target itself may be a link
+    while ($cur -and $cur.Length -gt $rootFull.Length -and
+           $cur.StartsWith($rootFull, [StringComparison]::OrdinalIgnoreCase)) {
+        try {
+            $i = Get-Item -LiteralPath $cur -Force -ErrorAction Stop
+            if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $true }
+        } catch { return $true }
+        $next = Split-Path -Parent $cur
+        if ($next -eq $cur) { break }   # cannot ascend further; stop rather than spin
+        $cur = $next
     }
     return $false
 }
@@ -554,6 +599,20 @@ function Remove-PMPath {
     if (-not (Test-PMPathSafe -Path $Path -Roots $DeclaredRoots -MinDepth $MinDepth)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'outside the roots this module declares'; Bytes = [int64]0 }
     }
+    # Both checks above are LEXICAL. This one asks the filesystem, because a path can satisfy
+    # every string test and still resolve somewhere else entirely. Checked here rather than just
+    # before Remove-Item so report mode refuses it too - a path we would not delete must not be
+    # counted as reclaimable.
+    foreach ($dr in $DeclaredRoots) {
+        if ([string]::IsNullOrWhiteSpace($dr)) { continue }
+        $drFull = try { [IO.Path]::GetFullPath($dr).TrimEnd('\') } catch { continue }
+        $pFull  = try { [IO.Path]::GetFullPath($Path).TrimEnd('\') } catch { continue }
+        if (-not $pFull.StartsWith($drFull + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (Test-PMPathTraversesLink -Path $Path -Root $drFull) {
+            return @{ Removed = $false; Skipped = $true; Bytes = [int64]0
+                      Reason = 'refused: the path reaches its target through a junction' }
+        }
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         return @{ Removed = $false; Skipped = $true; Reason = 'gone'; Bytes = [int64]0 }
     }
@@ -572,6 +631,34 @@ function Remove-PMPath {
         if ($partial -lt 0) { $partial = [int64]0 }
         return @{ Removed = $false; Skipped = $true; Bytes = $partial
                   Reason = "partially removed then failed: $($_.Exception.GetType().Name)" }
+    }
+}
+
+function Get-PMRemovalBucket {
+    <#
+        Map a Remove-PMPath result Reason to the bucket a module's Repair counts it in:
+        'vetoed' (the guard refused), 'gone' (it vanished between Test and Repair), or
+        'locked' (anything else, e.g. a partial delete that then threw).
+
+        Here rather than copied into each module because the copies DRIFTED. Three of the four
+        shipped modules never gained an arm for 'no declared roots supplied', so that refusal
+        fell through to their default bucket - locked - and since Ok is computed as
+        ($vetoed -eq 0), a run in which the guard refused every single target would still have
+        returned Ok = $true and rendered a green "Cleaned" badge. That is the exact failure the
+        comment above each of those switches claims was already fixed.
+
+        Unreachable today only because the dispatcher pre-empts a module with no resolvable
+        declared roots before Repair ever runs. "Unreachable by one caller's current control
+        flow" is not the same as safe, and it is the shape this project has been bitten by
+        before: a guard no input can reach reads like coverage in review.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Reason)
+    switch -Wildcard ($Reason) {
+        '*refused*'  { return 'vetoed' }
+        '*outside*'  { return 'vetoed' }
+        '*declared*' { return 'vetoed' }
+        'gone'       { return 'gone' }
+        default      { return 'locked' }
     }
 }
 

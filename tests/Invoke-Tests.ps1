@@ -110,6 +110,15 @@ It 'report-only run never applies, even for AutoApply' { -not (Test-PMApplyAllow
 It 'apply run does not apply without AutoApply'        { -not (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{}) }
 It 'apply run does not apply when AutoApply is false'  { -not (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{ AutoApply = $false }) }
 It 'apply run applies only when both agree'            {      (Test-PMApplyAllowed -Apply $true  -ModuleInfo @{ AutoApply = $true }) }
+# The gate used to fail OPEN on a type mistake. Import-PowerShellDataFile preserves the string
+# type and [bool]'false' is $true under 5.1, so a psd1 written with JSON habits promoted a module
+# to deleting while its author had written the opposite. Every one of these must read as NO.
+foreach ($bad in @('false', 'False', '0', 'no', '$false', 0, 1, 'true')) {
+    $b = $bad
+    It "a non-boolean AutoApply [$($b.GetType().Name) '$b'] does not grant apply" {
+        -not (Test-PMApplyAllowed -Apply $true -ModuleInfo @{ AutoApply = $b })
+    }
+}
 
 Write-Host "`n== category governance ==" -ForegroundColor Cyan
 $mf = [pscustomobject]@{ allowedCategories = @('maintenance', 'hygiene') }
@@ -388,6 +397,9 @@ Write-Host "`n== each forbidden pattern is pinned ==" -ForegroundColor Cyan
 # root check would have rejected them and the test would have proved nothing.
 foreach ($case in @(
     @{ P = 'C:\Users\Someone\AppData\Local\Temp\wsl\ext4';          N = 'a local wsl mount point';        R = @('C:\Users\Someone') }
+    # The directory ITSELF, not just its contents. '\\wsl\\' needed a trailing backslash, so the
+    # single target whose deletion destroys the whole mount was the one thing it did not refuse.
+    @{ P = 'C:\Users\Someone\AppData\Local\Temp\wsl';               N = 'the wsl mount directory itself'; R = @('C:\Users\Someone') }
     @{ P = 'C:\Users\Someone\AppData\Local\Temp\x\site-packages\y'; N = 'site-packages';                  R = @('C:\Users\Someone') }
     @{ P = 'C:\Users\Someone\Desktop\thing';                        N = 'Desktop';                       R = @('C:\Users\Someone') }
     @{ P = 'C:\Users\Someone\Pictures\thing';                       N = 'Pictures';                      R = @('C:\Users\Someone') }
@@ -1095,12 +1107,29 @@ It 'a clean module reports Clean with no findings' {
         return ($o.Result.Clean -eq $true -and @($o.Result.Items).Count -eq 0)
     } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
-It 'the uncapped module reports Count equal to its Items' {
-    # stale-app-temp is the one module with no Select-Object -First 25, so the two must agree.
+It 'stale-app-temp reports Count equal to its Items when under the cap' {
     $r = New-PMStaleTree
     try {
         $o = Invoke-PMModuleTest -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $r
         return ($o.Result.Count -eq 3 -and @($o.Result.Items).Count -eq 3)
+    } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and caps Items at 25 past it, while Count still carries the truth' {
+    # This module was the ONE uncapped Items in the run JSON, and the old test - titled "the
+    # uncapped module" - pinned that as intended using a 3-item fixture, so it could never have
+    # noticed. Its 7zO* / pip-unpack-* prefixes recur without limit and AutoApply = $false means
+    # it never deletes them, so its match set only ever grows.
+    $r = Join-Path ([IO.Path]::GetTempPath()) ("pm-stalecap-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $old = (Get-Date).AddDays(-60)
+    try {
+        foreach ($n in 1..30) {
+            $d = Join-Path $r ("7zO{0:D4}" -f $n)
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $d 'f.txt') -Value ('x' * $n) -Encoding UTF8
+            (Get-Item -LiteralPath $d).LastWriteTime = $old
+        }
+        $o = Invoke-PMModuleTest -ModuleId 'stale-app-temp' -RootResolver 'Get-StaleTempRoot' -FixtureRoot $r
+        return ($o.Result.Count -eq 30 -and @($o.Result.Items).Count -eq 25)
     } finally { Remove-Item -LiteralPath $r -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
@@ -1362,7 +1391,7 @@ It 'the forbidden PATH pattern list is exactly what ships' {
         '^\\\\'
         '\\DockerDesktop($|\\)'
         '\\docker\\volumes($|\\)'
-        '\\wsl\\'
+        '\\wsl($|\\)'
         '\\\.git($|\\)'
         '\\site-packages($|\\)'
         '\\node_modules($|\\)'
@@ -1528,6 +1557,65 @@ It 'but every module still sweeps freely below them' {
     # deleting anything while the suite above stays green.
     (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\abcd1234.xyz' -Roots @('C:\Users\Someone\AppData\Local\Temp')) -and
     (Test-PMPathSafe -Path 'C:\Users\Someone\AppData\Local\Temp\claude\1111-2222' -Roots @('C:\Users\Someone\AppData\Local\Temp\claude'))
+}
+
+Write-Host "`n== a path may not reach its target THROUGH a junction ==" -ForegroundColor Cyan
+# The lexical guard cannot see this. Reproduced end to end before the fix: a junction at the
+# project-slug level under Temp\claude let agent-scratchpads (AutoApply = $true) hand
+# Remove-PMPath a path that passed BOTH halves of the guard, and Remove-Item -Recurse then
+# destroyed the real tree while the junction survived. BACKLOG item 4 had closed that case as
+# unreachable because "-Recurse does not descend junctions"; this module never uses -Recurse.
+function New-PMJunctionTree {
+    # <base>\root\link  ->  <base>\target, with <base>\target\<guid>\canary.txt inside it.
+    $base = Join-Path ([IO.Path]::GetTempPath()) ("pm-jt-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+    $root = Join-Path $base 'root'
+    $target = Join-Path $base 'target'
+    $guid = '11111111-2222-3333-4444-555555555555'
+    New-Item -ItemType Directory -Path $root -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $target $guid) -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $target "$guid\canary.txt") -Value 'x' -Encoding UTF8
+    $null = cmd /c mklink /J "`"$(Join-Path $root 'link')`"" "`"$target`"" 2>&1
+    return @{ Base = $base; Root = $root; Target = $target
+              Through = (Join-Path $root "link\$guid"); Canary = (Join-Path $target "$guid\canary.txt") }
+}
+
+It 'Remove-PMPath refuses a path that traverses a junction, and the target survives' {
+    $t = New-PMJunctionTree
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $t.Root 'link'))) { return 'SKIP' }  # junctions unavailable
+        $r = Remove-PMPath -Path $t.Through -Roots @($t.Root) -DeclaredRoots @($t.Root)
+        # All three matter: refused, refused for the RIGHT reason, and the real data still there.
+        (-not $r.Removed) -and ($r.Reason -like '*junction*') -and (Test-Path -LiteralPath $t.Canary)
+    } finally { Remove-Item -LiteralPath $t.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'and that refusal is a path-guard VETO, not a "locked" miscount' {
+    # Ok = ($vetoed -eq 0), so bucketing this as locked would let a fully-refused run go green.
+    (Get-PMRemovalBucket -Reason 'refused: the path reaches its target through a junction') -eq 'vetoed'
+}
+It 'but an ordinary nested path under the same root is still removable' {
+    # The positive control. Without it, a rule that refused EVERYTHING would pass the test above
+    # while silently stopping the tool from deleting anything at all.
+    $t = New-PMJunctionTree
+    try {
+        $plain = Join-Path $t.Root 'ordinary\22222222-3333-4444-5555-666666666666'
+        New-Item -ItemType Directory -Path $plain -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $plain 'f.txt') -Value 'x' -Encoding UTF8
+        $r = Remove-PMPath -Path $plain -Roots @($t.Root) -DeclaredRoots @($t.Root)
+        $r.Removed -and -not (Test-Path -LiteralPath $plain)
+    } finally { Remove-Item -LiteralPath $t.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'a junction that IS the target stays deletable, and only the link goes' {
+    # Deleting a reparse point removes the link, not the tree behind it (BACKLOG item 4 cases A
+    # and B, both measured "survived"), so stale junctions must remain cleanable.
+    $t = New-PMJunctionTree
+    try {
+        if (-not (Test-Path -LiteralPath (Join-Path $t.Root 'link'))) { return 'SKIP' }
+        $r = Remove-PMPath -Path (Join-Path $t.Root 'link') -Roots @($t.Root) -DeclaredRoots @($t.Root)
+        $r.Removed -and (Test-Path -LiteralPath $t.Canary)
+    } finally { Remove-Item -LiteralPath $t.Base -Recurse -Force -ErrorAction SilentlyContinue }
+}
+It 'Test-PMPathTraversesLink fails closed on a directory it cannot inspect' {
+    (Test-PMPathTraversesLink -Path 'Q:\nope\deeper\leaf' -Root 'Q:\nope')
 }
 
 $tail = if ($script:Skip) { " ({0} SKIPPED - those verified nothing)" -f $script:Skip } else { '' }

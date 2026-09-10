@@ -13,9 +13,11 @@ real traps on their own. The path-pattern gaps (2) were then a single batch in a
 one test shape, closed before a new module made them reachable rather than after. 3 shipped; 4
 was closed as won't-fix once the threat model was pinned down.
 
-Nothing still open here is reachable through the four shipped modules today. That is the reason
-none of it is urgent, and also the reason it is easy to leave until a fifth module quietly makes
-it reachable.
+Round 1 ended by saying nothing still open was reachable through the four shipped modules. Round 2
+(item 6) found that this was false: a junction at the project-slug level made `agent-scratchpads`
+delete outside its declared root, and item 4 had closed that very case as unreachable. The claim
+is worth keeping visible precisely because it was wrong - "not reachable today" is a statement
+about the paths someone thought to check.
 
 ---
 
@@ -94,7 +96,21 @@ sequence was eaten as an escape, so the directory the test claimed to create nev
 the test passed no matter what. The patch script asserted its *anchor* matched; it did not
 verify the *replacement* landed. Assert both.
 
-## 4. ~~TOCTOU inside `Remove-PMPath`~~ WON'T FIX 2026-09-09, with the reason recorded
+## 4. ~~TOCTOU inside `Remove-PMPath`~~ WON'T FIX 2026-09-09 - **but case C was REOPENED and FIXED, see below**
+
+> ⚠ **Read this before trusting anything in this item.** The analysis below concluded case C was
+> unreachable because "no module can enumerate" a path through a junction. That is **false**, and
+> a round-2 audit reproduced the deletion. `agent-scratchpads` enumerates in two NON-recursive
+> passes, so the `-Recurse` measurement that the conclusion rests on never applied to it. A
+> junction at the project-slug level under `Temp\claude` produced a candidate that passed both
+> halves of the path guard, and `Remove-Item -Recurse` destroyed the junction's target while the
+> link survived. Fixed by `Test-PMPathTraversesLink`, which is the same "cheap mitigation" this
+> item describes at the bottom - it was right about the remedy and wrong about the urgency.
+>
+> The residual TOCTOU *race* (swapping a directory between the check and `Remove-Item`) is still
+> WON'T FIX, and the reasoning below still holds for it. What changed is that the case no longer
+> needs an attacker at all: an ordinary junction someone created for their own convenience was
+> enough.
 
 Measured on this build rather than assumed, because the original entry overstated it:
 
@@ -107,7 +123,10 @@ Measured on this build rather than assumed, because the original entry overstate
 `Remove-Item -Recurse` deletes the reparse point, not the target, which kills the textbook attack.
 Only case C works, and reaching it needs a module to hand `Remove-PMPath` a path that goes through
 a link. `Get-ChildItem -Recurse` does not descend junctions (measured: zero files found under a
-directory containing one), so no module can enumerate one. That leaves a single route: the one
+directory containing one), so no module can enumerate one. **-- This sentence is the error.**
+The measurement was sound; the inference was not. `agent-scratchpads` never calls `-Recurse`:
+it makes two separate non-recursive listings, and a non-recursive listing of a junction DOES
+return the target's children, with the link path preserved as their `.FullName` prefix. That leaves a single route: the one
 module that deletes individual FILES rather than directories, with an attacker swapping an
 intermediate directory between Test and Repair.
 
@@ -184,6 +203,176 @@ caller not handed an enumerated `.FullName`, which is exactly why it carries a g
 change, so every module caller counts the same segments it did before and only the uninstaller
 gets stricter. This is the fifth time on this project that writing a test for something small
 found something that was not small.
+
+## 6. Four parallel audits, 2026-09-09 (round 2)
+
+What shipped in that round is in the commit; this is what it deliberately left. The ordering
+principle is unchanged - coverage before change, latent-safety before capability, design
+decisions last - but round 2 added one: **a closed item is not evidence.** Item 4 below was
+closed WON'T FIX on reasoning that turned out to be false, and it read as settled for exactly as
+long as nobody re-derived it.
+
+### 6a. The re-enumeration between Test and Repair costs a second full sizing pass
+
+**Measured, HIGH on cost, zero on safety.** Repair re-derives candidates, and the candidates
+function measures `Bytes` inline, so every path is sized twice on an apply run. The comments
+claiming otherwise are fixed; the cost is not. At the documented vs-installer peak (13,341
+directories, ~6 min per sizing pass) that is roughly **+6 minutes per apply run**; at today's
+state it is +13.2 s for vs and +2.4 s for agent-scratchpads.
+
+**Keep the re-enumeration.** It re-applies every selection rule at delete time, which is a real
+safety property - a directory that became active between phases is spared - and item 4's threat
+model assumes that window exists. Only the *sizing* is waste. The fix is an in-memory path→bytes
+map on `$ctx` for the Repair phase, never serialized, with Repair measuring only paths it newly
+selected.
+
+### 6b. The vs payload-cache probe is the single largest measured cost, and finds nothing
+
+**Measured 13,237 ms, twice per apply run, zero hits.** It calls `Get-PMChildDirectory` on every
+non-8.3-named TEMP directory older than 24h - 6,402 of them on this box - and reached the `.vsix`
+stage zero times. The payload cache is *one* directory with a stable random name: cache its
+resolved path and re-probe only that, falling back to the full sweep when the cached path stops
+qualifying.
+
+### 6c. Cheaper existence checks in the two shared readers
+
+`Test-Path -LiteralPath` measured **3,398 ms** over 6,402 paths against **280 ms** for
+`[IO.Directory]::Exists` - 12x, and it scales with every future per-item module. The guard itself
+must stay: it is what separates "path absent, return empty quietly" from "path present but
+unlistable, record a read error". The native call preserves that distinction exactly.
+
+### 6d. Two walks per candidate that could be one
+
+`Get-PMNewestWriteUtc` and `Get-PMPathSize` are byte-for-byte the same traversal. An *idle*
+candidate gets no early exit from the first, so both run in full - and with 6a that is four full
+walks of the idle set per apply run where one per phase would do. A fused walk returning
+`(NewestUtc, Bytes)` keeps the `-NewerThanUtc` early exit: bail as soon as something beats the
+cutoff and discard the partial size, since that candidate is skipped anyway.
+
+Also `plex-bif-orphans` materialises all 47,802 `FileInfo` plus a parallel HashSet (~35 MB), twice
+per apply run. Keep the re-walk - it re-verifies the `.bif` partner at delete time, which is the
+module's whole rule - and retain names rather than `FileInfo`.
+
+### 6e. The read-error accumulator is uncapped and quadratic
+
+`Add-PMReadError` appends with `+=` inside per-directory walk loops and **nothing ever consumes
+the retained `ErrorRecord` objects** - only the counts, one sample and ≤10 deduped messages are
+read. On a tree where every read fails, 13,341 directories is ~89 M element copies (the same
+shape measured at 6,733 ms), and each record carries an `InvocationInfo` at roughly 1-3 KB, so
+100k of them is 100-300 MB held in a SYSTEM process. A cap of ~200 retained plus a monotonic
+counter costs nothing. Normal runs are unaffected - current logs show `readErrors: 1`.
+
+### 6f. Test fixtures stranded on the throw path, and they are un-deletable
+
+Eight sites create and populate a fixture *before* the `try` whose `finally` removes it, so
+anything throwing in between strands it. Worse than an ordinary temp leak: `New-PMFixtureRoot`
+calls `Set-PMPayloadAcl` when elevated, so the stranded directory grants Users read-only and
+**the non-elevated user cannot delete it** - and its name matches nothing in `stale-app-temp`'s
+allowlist, so this tool will never clean it up either. Move the construction inside the `try`.
+Related: `icacls /reset` is invoked bare in a `finally`; if it throws, the Deny-ACE'd directory
+survives.
+
+### 6g. `Get-PMNewestWriteUtc` does not reparse-guard its ROOT push
+
+`Get-PMPathSize` checks the top-level attribute and returns 0 for a reparse-point root;
+`Get-PMNewestWriteUtc` pushes `$Path` unconditionally and only checks *sub*directories. So for a
+session directory that is itself a junction, age is measured across the target's whole tree while
+size reports 0 and `Remove-Item` would delete only the link - three readers describing three
+different things. Now that `Test-PMPathTraversesLink` blocks the dangerous case this is a
+consistency defect rather than a hole, but the stated invariant is that measurement matches what
+deletion frees.
+
+### 6h. Two numbers share a word and count different things
+
+`summary.found` counts every module that found something (`reported` **and** `applied`); the HTML
+"Found" tile counts only `reported`. On an apply run where all three permitted modules act, the
+JSON says `found: 3` and the report says Found 0 / Cleaned 3. Same for `summary.partial` (total
+read errors) versus the "Couldn't read" tile (distinct messages, capped at 10).
+
+**The "every number opens" promise is intact** - the tile renders `$rows.Count`, so it always
+expands to exactly what it counted. What is overstated is the README's "the two can never
+disagree": both derive from one object, but they derive *different things* under one label. The
+honest fix is naming, not logic, and it should not change the JSON schema.
+
+### 6i. Guarantees the README states more strongly than the code provides
+
+Three, all currently unreachable through the four shipped modules, all worth closing the gap
+between prose and behaviour rather than softening the prose:
+
+- **Gate 3 is opt-in.** README presents "the interactive user was confirmed logged on" as
+  unconditional; `Test-PMActingUserConfirmed` returns `$true` immediately when a module omits
+  `RequiresUserSid` - while the dispatcher still expands that module's roots against the
+  *inferred* profile, which makes the path guard agree. All four shipped modules declare it.
+- **`DeclaredRoots` is module-mediated.** README says the dispatcher "hands it to `Remove-PMPath`
+  so the module cannot influence it". It hands it to the *module*, which passes it on; and
+  `$Context` is a hashtable shared by reference across both phases, so `Test` can mutate it for
+  `Repair`. The dispatcher genuinely owns the *value* (`$info` never enters `$ctx`, and
+  `Import-PowerShellDataFile` cannot execute code) - it does not own the *channel*.
+- **`Remove-PMPath` enforces only gate 4.** It knows nothing about `-Apply` or `AutoApply`, and
+  nothing stops a module calling it from `Test-PMModule`. Gates 1-3 live entirely in the
+  dispatcher.
+
+### 6j. `Test-PMPayloadSecure` has three gaps in the check the README calls load-bearing
+
+It trusts `S-1-5-19`/`S-1-5-20` (LOCAL SERVICE / NETWORK SERVICE) as "already privileged enough",
+which is untrue - they are restricted accounts strictly below SYSTEM, so a write ACE for
+NETWORK SERVICE is a real escalation path it would approve. It reads `$acl.Access` only and never
+checks the **owner**, who always holds implicit `WRITE_DAC` - so a hand-copied payload *owned* by
+a standard user passes with a perfectly locked DACL. And it checks the payload root only, while
+every `.ps1` under `lib\` is dot-sourced twice per run, so a permissive ACE placed directly on
+`lib\` with inheritance disabled is invisible to it.
+
+### 6k. Smaller, each cheap
+
+- **`Get-PMDownloadsPath` trusts a user-writable registry value.** Under SYSTEM that is a
+  file-creation primitive into any existing directory. Bounded - the filename is fixed and
+  `Remove-PMOldReports` can only match that same pattern, so no unintended deletion - and the
+  existing `system32` re-point covers only one case, not `C:\Windows\Temp` or `C:\ProgramData`.
+- **8.3 short names survive `[IO.Path]::GetFullPath`.** `C:\PROGRA~1\x` never matches the
+  `Program Files` pattern. Unreachable today because every target comes from an enumerated
+  `.FullName`; it bites the first time a module takes a path from config or an operator.
+  Normalising via `(Get-Item -LiteralPath $Path).FullName` before the regex sweep closes it.
+  Everything else adversarial was checked and is genuinely handled: trailing dots and spaces,
+  interior dots, forward slashes, `..`, drive-relative `C:foo`, `\\?\`, and ADS (which throws and
+  fails closed under 5.1 - note .NET Core would *not* throw).
+- **`\??\` is not covered by the `^\\\\` rule**, whose comment claims the device prefix. Single
+  leading backslash, so it passes the sweep and MinDepth. Harmless (it can match no declared root
+  and Win32 refuses to open it) but the comment over-promises.
+- **`Expand-PMRoot` escapes `$` in one of three branches.** `%LOCALAPPDATA%` and `%APPDATA%`
+  concatenate raw, so `$&` in a profile path is a substitution token. Fails closed - the result
+  can only become a nonexistent root - and the fix already exists one line above.
+- **The unresolved-token check misses digits.** `'%[A-Za-z_]+%'` does not match `%FOO2%`, so it is
+  returned literally instead of refused. Still fails closed; `%[^%]+%` is exact.
+- **Two of seven `AppData\Roaming` credential alternatives are fully subsumed** by the `.ssh` and
+  `.aws` rules below them, so the two tests naming them pass either way - coverage that
+  discriminates nothing, which is the condition the last mutation run existed to catch.
+- **Two tests are narrower than the claims they pin.** The "no external fetch" test would miss a
+  protocol-relative `//cdn`, a relative `<link rel=stylesheet>`, or a non-http `@font-face`; the
+  escaping test exercises only `items[].path`, while `detail`, `readErrorMessages` and `id` are
+  escaped in code and pinned by nothing. Both claims are currently TRUE - verified exhaustively
+  this round - so this is regression cover, not a live defect.
+- **Six of nine context keys are never read** by anything, tests included: `UserSid`,
+  `PayloadRoot`, `ModuleRoot`, `LibDir`, `RunId`, `IsInteractiveUserLoggedIn`. The last is the
+  one to act on: it duplicates a fact the dispatcher has *already* acted on, so a module author
+  could reasonably read it as an invitation to make the decision again, locally.
+- **`-WhatIfOnly` is production-dead.** Only a test passes it. Either wire it or delete it; a
+  parameter that exists to prevent drift, and has itself drifted out of use, is the worst of both.
+- **`Get-PMChildFile -Filter` is unused and is the documented trap** (Win32 `-Filter` matches
+  `.tmpx` via 8.3 legacy, the bug item 1 mutation-tested). Delete it or move the warning onto the
+  parameter. Same shape: `Remove-PMPath -MinDepth` and `Get-PMReadErrorMessages -Max` are never
+  passed by any caller, so three tuning knobs in the deletion path are only ever exercised at
+  their defaults.
+
+### 6l. The one that is a note, not a finding
+
+`vs-installer-scratch` and `stale-app-temp` take age from the **directory's own `LastWriteTime`** -
+precisely the measurement item 3 established is unreliable, and which `agent-scratchpads` was
+rewritten to avoid. `stale-app-temp` is report-only so it can only mis-report. `vs-installer-scratch`
+has `AutoApply = $true`, and its 24-hour floor plus the requirement for `setup.exe` **and**
+`resources\app\ServiceHub` makes it safe in practice. Worth knowing before a fifth module copies
+the pattern with a looser fingerprint.
+
+---
 
 ## Decisions worth revisiting later, not bugs
 

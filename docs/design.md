@@ -90,9 +90,16 @@ module marks its load-bearing read `-Critical`, pinned by a test, because that i
 ### The audit trail replaces the backup
 
 Nothing can snapshot tens of gigabytes of scratch, so every run records the paths considered with
-sizes and the reason each was kept or removed. `Remove-PMPath` takes `-WhatIfOnly` rather than the
-module carrying a second code path for report mode, because two paths that must agree is exactly
-the shape that drifts.
+sizes and the reason each was kept or removed.
+
+This paragraph used to go on to say that `Remove-PMPath` takes `-WhatIfOnly` "rather than the
+module carrying a second code path for report mode". That stopped being true and the doc did not
+notice. When the declared-roots fix landed, `-WhatIfOnly` was dropped from all four module call
+sites, and the dispatcher never enters `Repair` in report mode at all — report figures come from
+`Test`. The parameter still exists and is exercised only by a test. The current behaviour is at
+least as safe (report mode cannot reach the removal path even by accident), but a reviewer who
+believed the old sentence would think report mode exercises the real deletion path, and it does
+not.
 
 ### The report is the product
 

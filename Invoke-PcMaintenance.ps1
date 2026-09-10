@@ -106,7 +106,19 @@ try {
 
     $manifest = Get-PMManifest -Path $ManifestPath
     $enabled  = Get-PMEnabledModules -Manifest $manifest
-    if ($Only) { $enabled = @($enabled | Where-Object { $Only -contains $_.id }) }
+    if ($Only) {
+        # A name that matches nothing is a typo, and it must not read as a clean machine.
+        # `-Only plex-bif-orphan` (singular) used to log total=0 clean=0 found=0, write a run
+        # JSON with an empty modules array, ADVANCE latest.json and emit a "Reclaimable now: 0 B"
+        # report, exit 0 - indistinguishable from a sweep that genuinely found nothing.
+        # Throwing here lands in the fatal handler, which deliberately does not touch latest.json.
+        $known = @($enabled | ForEach-Object { [string]$_.id })
+        $unknown = @($Only | Where-Object { $known -notcontains $_ })
+        if ($unknown.Count) {
+            throw ("-Only names no enabled module: {0}. Enabled: {1}" -f ($unknown -join ', '), ($known -join ', '))
+        }
+        $enabled = @($enabled | Where-Object { $Only -contains $_.id })
+    }
 
     $user = Get-PMInteractiveUserSid
     $sidLabel = if ($user.Sid) { $user.Sid } else { '<none>' }
@@ -189,10 +201,17 @@ try {
             $row.readErrorMessages = @($tw.ReadErrorMessages)
             $row.bytes = if ($null -ne $t.Bytes) { [int64]$t.Bytes } else { [int64]0 }
             $row.items = @($t.Items)
-            # Count is the TRUE number found. Items is capped by some modules so a 6,935-orphan
+            # Count is the TRUE number found. Items is capped by every module so a 6,935-orphan
             # run does not bloat every run json, so logging @($t.Items).Count would report the
             # cap and quietly disagree with the module's own Detail string.
-            $row.count = if ($null -ne $t.Count) { [int]$t.Count } else { @($t.Items).Count }
+            #
+            # Tested for PRESENCE, the same way Clean is above, not with `$null -ne $t.Count`.
+            # That test is version-dependent: under 5.1 a pscustomobject with no Count member
+            # yields $null and the fallback runs, but under PowerShell 7 the scalar-as-collection
+            # adapter supplies Count = 1, so the condition is ALWAYS true and the fallback is
+            # unreachable. A future module returning Items without Count would then have a
+            # 6,000-item finding recorded as 1 - in the record that stands in for a backup.
+            $row.count = if ($t.PSObject.Properties['Count']) { [int]$t.Count } else { @($t.Items).Count }
             $row.detail = [string]$t.Detail
 
             # A module that could not READ must never pass as clean. Silence and emptiness look

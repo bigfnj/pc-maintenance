@@ -63,6 +63,15 @@ if ($RemoveFiles) {
     $outcome = Remove-PMPayloadFiles -Root $PayloadRoot -KeepLogs:$KeepLogs
     if ($outcome.Blocked) { Write-PMLog $outcome.Detail 'ERROR'; exit 1 }
     Write-PMLog $outcome.Detail $(if ($outcome.Removed) { 'CHANGE' } else { 'SKIP' })
+    # Removed = $false has to reach the EXIT CODE, not just the log level. BACKLOG item 5 records
+    # this bug as "...at CHANGE level, exit 0, with a SYSTEM-executed script tree still on disk";
+    # the message half was fixed and this half was not. The task is already unregistered by now,
+    # so a wrapper trusting $LASTEXITCODE would record success over a payload still on disk under
+    # a hardened ACL that a non-admin cannot clean up.
+    if (-not $outcome.Removed) {
+        Write-PMLog 'uninstall INCOMPLETE - some payload files could not be removed' 'ERROR'
+        exit 1
+    }
 } else {
     # -KeepLogs alone used to do nothing and say nothing. Nothing is being deleted, so there is
     # nothing to keep; a switch that silently does not apply is worse than one that objects.
