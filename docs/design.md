@@ -40,9 +40,10 @@ The original repairs by default and takes `-DryRun`. This reports by default and
 The failure modes are asymmetric: an unrepaired preference is visible and recoverable, a wrongly
 deleted file is neither.
 
-### Deletion needs three independent agreements
+### Deletion needs four independent agreements
 
-`-Apply` on the dispatcher, `AutoApply = $true` in the module's own manifest, and the path guard.
+`-Apply` on the dispatcher, `AutoApply = $true` in the module's own manifest, an interactive user
+confirmed logged on rather than inferred from the registry, and the path guard.
 `Test-PMApplyAllowed` treats an absent `AutoApply` as false, so a module that forgets to declare it
 is report-only rather than trusted. This is what lets a class sit observational for months while a
 proven one acts, and that per-class trust decision is the reason this is a framework rather than
@@ -53,7 +54,9 @@ one script.
 Same idea, moved to where the damage is. `Test-PMPathSafe` requires both:
 
 1. the target is under one of the module's declared `Roots`, and
-2. it matches no forbidden pattern and is at least `MinDepth` (3) segments deep.
+2. it matches no forbidden pattern and is at least `MinDepth` (2) DIRECTORIES deep, the drive
+   excluded. It counted the drive letter until an audit found that made the uninstaller read one
+   level shallower than it asked for; see BACKLOG item 5.
 
 (1) alone would let a module with a broad root reach a Docker volume inside it. (2) alone would let
 a module delete anywhere nobody had thought to forbid. Neither list is manifest-configurable.
@@ -118,10 +121,7 @@ ran on. The whole report step is wrapped: losing the delivery is a warning, neve
 
 ## Backlog
 
-- A liveness check for `agent-scratchpads`, so it could be promoted to `AutoApply`. An open handle
-  on the session directory or a pid file the agent maintains; not a longer timeout.
-- Promote individual entries out of `stale-app-temp` into their own modules once one has been
-  watched long enough to state a mechanical rule for it. Flipping the whole list to `AutoApply`
-  would be trusting every entry at once.
-- Decide what the weekly report should do when nothing is found. Today it always writes; always
-  speaking is how a weekly job becomes background noise.
+Open work lives in [../BACKLOG.md](../BACKLOG.md), not here. This section used to carry its own
+copy and it rotted: two of its three items were closed, and the third - a liveness check for
+`agent-scratchpads` - was not merely done but **wrong**, since the real defect was the clock, not
+liveness. A second list is a second thing to forget to update.

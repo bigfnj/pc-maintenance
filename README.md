@@ -134,7 +134,7 @@ Non-destructive, no Pester dependency. Run it under **Windows PowerShell 5.1**, 
 because 5.1 is what the scheduled task runs; the suite parses every script under 5.1 for that
 reason, and says so loudly if you run it under 7.
 
-96 tests elevated, 95 plus one honest SKIP otherwise. A skip is counted and printed separately
+205 tests elevated, 204 plus one honest SKIP otherwise. A skip is counted and printed separately
 rather than folded into the pass total: a check that reports success while verifying nothing is
 the exact failure this project exists to catch, so the suite must not commit it either.
 
